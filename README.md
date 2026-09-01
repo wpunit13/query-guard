@@ -26,7 +26,29 @@ go test ./...
 
 ## Local test-drive (Trino + proxy)
 
-`scripts/test-drive.sh` brings up a self-contained, reproducible environment:
+Two options:
+
+### Option A — fully Dockerized (no local Java/Trino needed)
+
+```bash
+scripts/docker-harness.sh start    # build image + start Trino & proxy in Docker
+scripts/docker-harness.sh status   # show status + health
+scripts/docker-harness.sh stop    # stop both containers
+```
+
+This runs both Trino (`trinodb/trino:476`) and query-guard as containers on a
+shared network. Query-guard references Trino by the compose service name, so no
+host networking is needed.
+
+| Component | Address |
+|-----------|---------|
+| Trino (container) | `http://localhost:8082` |
+| query-guard proxy (container) | `http://localhost:8091` |
+
+### Option B — local processes (Java 25 + built binary)
+
+`scripts/test-drive.sh` brings up a self-contained environment using your local
+Java runtime:
 
 - a **latest Trino** coordinator (requires **Java 25**, Temurin recommended)
 - the **query-guard proxy** pointed at it

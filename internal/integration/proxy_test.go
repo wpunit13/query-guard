@@ -198,6 +198,42 @@ func TestE2E_BlockedQueryLifecycle(t *testing.T) {
 	}
 }
 
+func TestE2E_TrinoURIsRewrittenToClientHost(t *testing.T) {
+	// A bypass statement returns a Trino page whose URLs point at an internal
+	// upstream host. Because it is bypassed (no preflight), only the reverse
+	// proxy forwards it — exercising the ModifyResponse URI rewrite.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"q","infoUri":"http://internal-trino:8080/ui/query.html?q","nextUri":"http://internal-trino:8080/v1/statement/queued/q/1"}`))
+	}))
+	defer srv.Close()
+
+	p := e2ePolicy(srv.URL)
+	cfg := config.NewConfig(p)
+	h, err := proxy.NewHandler(cfg, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/statement", strings.NewReader("SHOW SCHEMAS FROM tpch"))
+	req.Host = "client:8091" // the address the client used to reach us
+	h.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if strings.Contains(body, "internal-trino:8080") {
+		t.Errorf("internal upstream host leaked into response: %s", body)
+	}
+	for _, want := range []string{
+		`"infoUri": "http://client:8091/ui/query.html?q"`,
+		`"nextUri": "http://client:8091/v1/statement/queued/q/1"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("response missing %q; got: %s", want, body)
+		}
+	}
+}
+
 func TestE2E_BypassStatement(t *testing.T) {
 	h, mock, _ := newE2EHandler(t, allowedPlan)
 
