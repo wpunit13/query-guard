@@ -121,6 +121,38 @@ Guarded connection summary:
   it is valid SQL on the `orders` table.
 - For a quick runnable example, see the TPCH queries in `internal/integration/`.
 
+## Health & readiness
+
+- `GET /healthz` — liveness probe. Always `200` while the process is up.
+- `GET /readyz` — readiness probe. `200` when the upstream is reachable,
+  `503` otherwise. Used by the Helm chart.
+
+## Deployment (Kubernetes/Helm)
+
+Build the image and lint the Helm chart:
+
+```bash
+docker build -t query-guard:local -f deploy/Dockerfile .
+helm lint deploy/helm/
+```
+
+Render and inspect the manifests:
+
+```bash
+helm template query-guard deploy/helm/
+helm template query-guard deploy/helm/ --set autoscaling.enabled=true
+```
+
+The chart ships:
+- `templates/deployment.yaml` — probes on `/healthz` (liveness) and `/readyz`
+  (readiness), policy mounted from a ConfigMap at `/etc/query-guard/policy.yaml`.
+- `templates/service.yaml` — points at the proxy HTTP port (`8090`).
+- `templates/configmap.yaml` — mounts the `policy.yaml` from `values.policy`.
+- `templates/hpa.yaml` — CPU-based autoscaling, disabled by default.
+
+Set the `upstream.url` in `values.yaml` → `policy` to point at your Trino
+coordinator service.
+
 ## Status
 
 See `progress.md` for the phase tracker.

@@ -9,6 +9,8 @@ Thumbs.db
 *.swo
 *~
 
+.idea
+
 # Aider agent artifacts
 .aider*
 .aider.chat.history.md

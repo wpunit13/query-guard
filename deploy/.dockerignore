@@ -1,0 +1,13 @@
+# Keep the Docker build context lean.
+.git
+.github
+.vscode
+.idea
+*.log
+*.md
+!README.md
+Modelfile
+deploy/helm
+tests-driven
+query-guard
+coverage.out
