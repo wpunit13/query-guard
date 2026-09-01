@@ -1,0 +1,34 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# query-guard .gitignore
+# ──────────────────────────────────────────────────────────────────────────────
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Aider agent artifacts
+.aider*
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v4/
+
+# Local model / tooling config
+Modelfile
+
+# Compiled binary
+/query-guard
+
+# Runtime logs
+*.log
+queryguard.log
+
+# Local test-drive data (Trino install, etc.)
+.qg-test/
+.qg-trino*/
+
+# Markdown docs — keep only README.md tracked
+*.md
+!README.md

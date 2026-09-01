@@ -1,0 +1,39 @@
+# query-guard test-drive policy
+server:
+  port: 8090
+  read_timeout: 30s
+  write_timeout: 5m
+  shutdown_grace_period: 10s
+
+upstream:
+  url: http://localhost:8082
+  timeout: 30s
+
+preflight:
+  timeout: 2s
+  max_concurrent: 5
+
+rules:
+  # Tier 1a: tables that may never be queried.
+  table_blocklist:
+    - lineitem        # bare name matches tpch.tiny.lineitem / any schema
+
+  # Tier 1b: these tables require a WHERE on the listed column.
+  required_filters:
+    - catalog: tpch
+      schema: tiny
+      table: orders
+      column: orderdate
+
+  # Tier 2: pre-flight cost limits.
+  cost_limits:
+    - catalog: tpch
+      schema: tiny
+      table: orders
+      max_scan_bytes: 100000        # orders tiny scans ~210000 → blocks
+      max_rows: 0
+    - max_scan_bytes_per_query: 8000000   # global 8 MB / query
+
+telemetry:
+  enabled: true
+  path: /metrics
