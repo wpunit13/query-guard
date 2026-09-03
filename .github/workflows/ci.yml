@@ -1,0 +1,72 @@
+# CI for query-guard: build, vet, test, format check, and Helm lint.
+# Runs on every PR and on pushes to main.
+#
+# Note: the module requires Go 1.26 (see go.mod); setup-go resolves the
+# version from go.mod via go-version-file.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build, vet & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -race -count=1
+
+      - name: Check formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            echo "Run: gofmt -w ."
+            exit 1
+          fi
+
+  helm:
+    name: Helm lint & template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Helm lint
+        run: helm lint deploy/helm/
+
+      - name: Helm template (default values)
+        run: helm template query-guard deploy/helm/ > /dev/null
+
+      - name: Helm template (TLS enabled)
+        run: |
+          helm template query-guard deploy/helm/ \
+            --set tls.enabled=true \
+            --set tls.secretName=ci-tls > /dev/null

@@ -3,7 +3,7 @@ package integration
 import (
 	"encoding/json"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -121,7 +121,7 @@ func newE2EHandler(t *testing.T, planJSON string) (*proxy.Handler, *mockTrino, *
 	eval := engine.NewTrinoEvaluator(cfg, nil)
 	metrics := telemetry.NewMetrics(nil)
 
-	h, err := proxy.NewHandler(cfg, eval, log.New(io.Discard, "", 0))
+	h, err := proxy.NewHandler(cfg, eval, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestE2E_TrinoURIsRewrittenToClientHost(t *testing.T) {
 
 	p := e2ePolicy(srv.URL)
 	cfg := config.NewConfig(p)
-	h, err := proxy.NewHandler(cfg, nil, log.New(io.Discard, "", 0))
+	h, err := proxy.NewHandler(cfg, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}

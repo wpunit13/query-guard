@@ -1,0 +1,58 @@
+# GoReleaser configuration — release binaries on v*.*.* tags.
+#
+# Produces static (CGO-disabled) binaries for linux/amd64 + linux/arm64,
+# packaged as tar.gz with SHA256 checksums, attached to the GitHub Release.
+# Consumers download, verify, and build their own internal images from them.
+#
+# Local dry run:  goreleaser check && goreleaser release --snapshot --clean
+# Release build runs in .github/workflows/release-binaries.yml.
+
+version: 2
+
+project_name: query-guard
+
+builds:
+  - id: query-guard
+    main: ./cmd/queryguard
+    binary: query-guard
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      # Strip debug info; keep the binary static and small.
+      - -s -w
+
+archives:
+  - id: query-guard
+    formats: [tar.gz]
+    # Archive name: query-guard_<version>_<os>_<arch> (GoReleaser default).
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      # Ship a default policy and README alongside the binary so the archive
+      # runs (and is reviewable) as-is.
+      - policy.yaml
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  # Release notes are curated on the GitHub Release page; do not generate
+  # a commit-based changelog into the archive/notes automatically.
+  disable: true
+
+release:
+  # Binaries + checksums are attached to the existing release for the tag
+  # (created manually or by the GitHub Release UI).
+  draft: false
+  mode: replace
+  header: |
+    Download the archive for your platform, verify it against checksums.txt,
+    and run `./query-guard -config policy.yaml`. Container images are also
+    published to ghcr.io (see README).

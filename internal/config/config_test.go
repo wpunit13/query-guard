@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,6 +111,80 @@ func TestDefaults_Applied(t *testing.T) {
 	}
 	if p.Upstream.Timeout != 30*time.Second {
 		t.Errorf("expected default upstream timeout 30s, got %v", p.Upstream.Timeout)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TLS Config Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestTLS_PartialConfigRejected(t *testing.T) {
+	cases := map[string]string{
+		"cert without key": `
+server:
+  port: 8080
+  tls:
+    cert_file: /etc/query-guard/tls/tls.crt
+
+upstream:
+  url: "http://trino:8080"
+
+rules:
+  table_blocklist: [t]
+`,
+		"key without cert": `
+server:
+  port: 8080
+  tls:
+    key_file: /etc/query-guard/tls/tls.key
+
+upstream:
+  url: "http://trino:8080"
+
+rules:
+  table_blocklist: [t]
+`,
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "policy.yaml")
+			writeFile(t, path, yaml)
+
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("expected error for partial TLS config, got nil")
+			}
+			if !strings.Contains(err.Error(), "cert_file and key_file") {
+				t.Errorf("error %q does not mention cert_file/key_file pairing", err)
+			}
+		})
+	}
+}
+
+func TestTLS_FullConfigAccepted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	writeFile(t, path, `
+server:
+  port: 8080
+  tls:
+    cert_file: /etc/query-guard/tls/tls.crt
+    key_file: /etc/query-guard/tls/tls.key
+
+upstream:
+  url: "https://trino:8443"
+
+rules:
+  table_blocklist: [t]
+`)
+
+	p, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if !p.Server.TLS.Enabled() {
+		t.Error("expected TLS.Enabled() == true with cert and key configured")
 	}
 }
 

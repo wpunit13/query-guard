@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"strings"
@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"query-guard/internal/config"
+	"query-guard/internal/ctxlog"
 	"query-guard/internal/engine"
 	"query-guard/internal/parser"
 	"query-guard/internal/telemetry"
@@ -48,17 +49,17 @@ type Handler struct {
 	cfg       *config.Config
 	evaluator engine.CostEvaluator
 	proxy     atomic.Pointer[httputil.ReverseProxy]
-	logger    *log.Logger
+	logger    *slog.Logger
 	metrics   *telemetry.Metrics
 	engine    string
 }
 
 // NewHandler builds a Handler. evaluator may be nil, in which case Tier 2 is
-// skipped and only Tier 1 static checks apply (fail-open). Telemetry is
-// attached separately via SetMetrics.
-func NewHandler(cfg *config.Config, evaluator engine.CostEvaluator, logger *log.Logger) (*Handler, error) {
+// skipped and only Tier 1 static checks apply (fail-open). A nil logger falls
+// back to slog.Default(). Telemetry is attached separately via SetMetrics.
+func NewHandler(cfg *config.Config, evaluator engine.CostEvaluator, logger *slog.Logger) (*Handler, error) {
 	if logger == nil {
-		logger = log.Default()
+		logger = slog.Default()
 	}
 
 	p := cfg.Get()
@@ -187,12 +188,22 @@ func (h *Handler) metricsPath() string {
 // query. The full body is buffered once (bounded by maxStatementBodyBytes) so
 // it can be parsed and then replayed upstream without losing the payload.
 func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
+	// Establish request correlation: honor an inbound X-Request-ID or mint a
+	// fresh one, and carry it through the context so the engine's log lines
+	// and this handler's logs (and the rejection body) all share one key.
+	reqID := r.Header.Get(ctxlog.HeaderName)
+	if reqID == "" {
+		reqID = ctxlog.NewID()
+	}
+	r = r.WithContext(ctxlog.WithRequestID(r.Context(), reqID))
+	log := h.logger.With("request_id", reqID)
+
 	// Read up to max+1 bytes so we can detect a body larger than the cap.
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxStatementBodyBytes+1))
 	if err != nil {
 		_ = r.Body.Close()
 		// Fail-open: cannot inspect, so forward the query untouched.
-		h.logger.Printf("[proxy] failed to read statement body: %v; forwarding (fail-open)", err)
+		log.Error("failed to read statement body; forwarding (fail-open)", slog.String("error", err.Error()))
 		h.record(telemetry.StatusBypassed)
 		h.forward(w, r, body)
 		return
@@ -202,7 +213,7 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 		// Oversized body: we cannot safely inspect it. Fail open by forwarding
 		// the full, un-truncated request (already-read prefix + remaining body)
 		// so the real query is never corrupted.
-		h.logger.Printf("[proxy] statement body exceeds %d bytes; forwarding unguarded (fail-open)", maxStatementBodyBytes)
+		log.Warn("statement body exceeds inspection cap; forwarding unguarded (fail-open)", slog.Int("cap_bytes", maxStatementBodyBytes))
 		h.record(telemetry.StatusBypassed)
 		h.forwardFull(w, r, body)
 		return
@@ -227,7 +238,7 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 	res, err := parser.Analyze(query)
 	if err != nil {
 		// Fail-open: parser error forwards the original query.
-		h.logger.Printf("[proxy] parser analyze error for query: %v; forwarding (fail-open)", err)
+		log.Error("parser analyze error; forwarding (fail-open)", slog.String("error", err.Error()))
 		h.metricsParserError()
 		h.record(telemetry.StatusBypassed)
 		h.forward(w, r, body)
@@ -243,8 +254,10 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 
 	// Tier 1: static AST checks — any violation is an immediate hard reject.
 	if reason, msg, allow := h.tier1(res); !allow {
+		log.Info("query rejected by tier 1",
+			slog.String("stage", string(reason)), slog.String("statement_class", res.StatementClass.String()))
 		h.record(telemetry.StatusBlocked)
-		h.reject(w, reason, msg)
+		h.reject(r, w, reason, msg)
 		return
 	}
 
@@ -256,8 +269,10 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 		} else if !allowed {
 			// Definitive limit breach → reject. (Blocked bytes were attributed
 			// to the telemetry counter inside tier2.)
+			log.Info("query rejected by tier 2",
+				slog.String("stage", string(reason)))
 			h.record(telemetry.StatusBlocked)
-			h.reject(w, ReasonCostLimitBreach, reason)
+			h.reject(r, w, ReasonCostLimitBreach, reason)
 			return
 		}
 	}
@@ -402,8 +417,11 @@ func (h *Handler) tier2(ctx context.Context, headers http.Header, query string) 
 		if errors.Is(err, engine.ErrPreflightConcurrency) {
 			h.metricsPreflightRejected()
 		}
-		// Fail-open: log and forward.
-		h.logger.Printf("[proxy] pre-flight evaluation error: %v (fail-open)", err)
+		// Fail-open: log and forward. The engine logs the error with the
+		// request ID from ctx; record the stage here too.
+		h.logger.Error("pre-flight evaluation error (fail-open)",
+			slog.String("request_id", ctxlog.FromContext(ctx)),
+			slog.String("error", err.Error()))
 		return false, "", err
 	}
 
@@ -435,9 +453,9 @@ func (h *Handler) forwardFull(w http.ResponseWriter, r *http.Request, prefix []b
 	h.currentProxy().ServeHTTP(w, r)
 }
 
-// reject writes a standard JSON 400 rejection.
-func (h *Handler) reject(w http.ResponseWriter, reason RejectionReason, message string) {
-	WriteRejection(w, http.StatusBadRequest, reason, message)
+// reject writes a standard JSON 400 rejection, correlated to the request ID.
+func (h *Handler) reject(r *http.Request, w http.ResponseWriter, reason RejectionReason, message string) {
+	WriteRejection(w, http.StatusBadRequest, reason, message, ctxlog.FromContext(r.Context()))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

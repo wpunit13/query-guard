@@ -26,19 +26,25 @@ spec:
             - "-config"
             - "/etc/query-guard/policy.yaml"
           ports:
-            - name: http
+            - name: {{ if .Values.tls.enabled }}https{{ else }}http{{ end }}
               containerPort: {{ .Values.containerPort }}
               protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
+              {{- if .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: {{ .Values.probes.livenessInitialDelaySeconds }}
             periodSeconds: {{ .Values.probes.livenessPeriodSeconds }}
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
+              {{- if .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: {{ .Values.probes.readinessInitialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readinessPeriodSeconds }}
           resources:
@@ -47,10 +53,20 @@ spec:
             - name: policy
               mountPath: /etc/query-guard
               readOnly: true
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: policy
           configMap:
             name: {{ include "query-guard.fullname" . }}-policy
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ required "tls.secretName is required when tls.enabled" .Values.tls.secretName }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

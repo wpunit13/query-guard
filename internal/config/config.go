@@ -32,7 +32,21 @@ type ServerConfig struct {
 	ReadTimeout   time.Duration `yaml:"read_timeout"`
 	WriteTimeout  time.Duration `yaml:"write_timeout"`
 	ShutdownGrace time.Duration `yaml:"shutdown_grace_period"`
+	TLS           TLSConfig     `yaml:"tls"`
 }
+
+// TLSConfig configures native HTTPS on the proxy listener. When CertFile and
+// KeyFile are both set the server serves HTTPS only (no plaintext listener),
+// so Authorization / X-Trino-* headers are never transmitted in the clear.
+// The certificate material itself lives in a mounted K8s Secret; only the
+// file paths belong in policy.yaml.
+type TLSConfig struct {
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+}
+
+// Enabled reports whether native TLS is configured.
+func (t TLSConfig) Enabled() bool { return t.CertFile != "" && t.KeyFile != "" }
 
 // UpstreamConfig defines the target database cluster to proxy to.
 type UpstreamConfig struct {
@@ -182,6 +196,20 @@ func (p *Policy) Validate() error {
 		if lim.MaxScanBytes < 0 || lim.MaxRows < 0 || lim.MaxScanBytesPerQuery < 0 {
 			return fmt.Errorf("cost limit values must be >= 0 (0 disables the limit), got %+v", lim)
 		}
+	}
+
+	// TLS must be either fully configured or fully absent: a cert without a
+	// key (or vice versa) would otherwise fail only at listen time, after the
+	// process has started.
+	tlsSet := 0
+	if p.Server.TLS.CertFile != "" {
+		tlsSet++
+	}
+	if p.Server.TLS.KeyFile != "" {
+		tlsSet++
+	}
+	if tlsSet == 1 {
+		return fmt.Errorf("server.tls: both cert_file and key_file must be set to enable TLS (got only one)")
 	}
 	return nil
 }

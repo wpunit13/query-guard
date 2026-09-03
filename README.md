@@ -153,6 +153,19 @@ Guarded connection summary:
 - `GET /readyz` — readiness probe. `200` when the upstream is reachable,
   `503` otherwise. Used by the Helm chart.
 
+## Logging & request correlation
+
+Logs are structured (`log/slog` key-value text). Every statement request is
+assigned a **request ID** — taken from an inbound `X-Request-ID` header if
+present, otherwise minted — that appears in:
+
+- all guard log lines for that request (tier 1/tier 2 decisions, fail-open
+  events, pre-flight errors from the engine),
+- the JSON rejection body (`"request_id": "…"`) returned to the client.
+
+Operators: ask users for the `request_id` from a rejected response to grep
+the guard's logs; send `X-Request-ID` from your own tooling to pre-correlate.
+
 ## Deployment (Kubernetes/Helm)
 
 Build the image and lint the Helm chart:
@@ -172,13 +185,119 @@ helm template query-guard deploy/helm/ --set autoscaling.enabled=true
 The chart ships:
 - `templates/deployment.yaml` — probes on `/healthz` (liveness) and `/readyz`
   (readiness), policy mounted from a ConfigMap at `/etc/query-guard/policy.yaml`.
-- `templates/service.yaml` — points at the proxy HTTP port (`8090`).
+- `templates/service.yaml` — points at the proxy HTTP(S) port (`8090`).
 - `templates/configmap.yaml` — mounts the `policy.yaml` from `values.policy`.
 - `templates/hpa.yaml` — CPU-based autoscaling, disabled by default.
 
 Set the `upstream.url` in `values.yaml` → `policy` to point at your Trino
 coordinator service.
 
+### Installing the chart from GHCR (OCI)
+
+Every release tag (`v*.*.*`) publishes the chart to GHCR as an OCI artifact,
+versioned to match the release:
+
+```bash
+# Pull the chart
+helm pull oci://ghcr.io/<owner>/query-guard/chart --version 1.0.1
+
+# Or install directly
+helm install query-guard oci://ghcr.io/<owner>/query-guard/chart \
+  --version 1.0.1 \
+  --set upstream.url=http://trino:8080
+```
+
+The chart version and `appVersion` are stamped from the git tag at package
+time — `Chart.yaml` in the repo is not bumped per release.
+
+### Installing from release binaries (no Docker / Go toolchain)
+
+Every release tag also publishes static linux binaries (amd64 + arm64) to
+the GitHub Release page, packaged with a default `policy.yaml` and a
+`checksums.txt`:
+
+```bash
+# Download from the release page, then verify and unpack:
+sha256sum -c checksums.txt
+tar xzf query-guard_<version>_linux_amd64.tar.gz
+./query-guard -config policy.yaml
+```
+
+These are ideal for consumers who build their own internal images from
+verified artifacts instead of pulling published container images — the
+archive contains the same distroless-compatible static binary the image uses.
+
+### TLS
+
+Native TLS is built into the proxy. When `server.tls.cert_file` and
+`server.tls.key_file` are set, the listener serves **HTTPS only** — there is
+no plaintext listener, so `Authorization` and `X-Trino-*` headers are never
+transmitted unencrypted. An HSTS header (`max-age=31536000; includeSubDomains`)
+is sent on every response when TLS is enabled.
+
+In the Helm chart, enable it with an existing `kubernetes.io/tls` Secret:
+
+```bash
+helm install query-guard deploy/helm/ \
+  --set tls.enabled=true \
+  --set tls.secretName=query-guard-tls
+```
+
+The chart mounts the Secret at `/etc/query-guard/tls` and appends the
+`server.tls` block to the policy automatically. The Secret is not created by
+the chart — manage it with cert-manager or your own process. Certificate
+rotation is restart-based: update the Secret and restart the pods
+(`kubectl rollout restart`); the distroless image has no reload signal.
+
+## Performance
+
+Measured with the in-repo load harness (`internal/integration/load_test.go`;
+run `go test ./internal/integration/ -run TestLoad -v`). The coordinator is a
+fake with a 10ms-per-hop pre-flight delay — these numbers measure the **proxy
+overhead**, not real Trino EXPLAIN cost (which dominates in production and
+depends entirely on your cluster).
+
+- **Pre-flight (Tier 2) latency cost** — 200 statement submissions, 16
+  concurrent clients, `preflight.max_concurrent: 5`:
+  - Tier 2 OFF: P50 ≈ 2.4ms, P95 ≈ 12ms
+  - Tier 2 ON (3 protocol hops × 10ms + gate queueing): P50 ≈ 38ms, P95 ≈ 50ms
+  - The added latency scales with your coordinator's EXPLAIN round-trip and
+    is capped by `preflight.max_concurrent` queueing. Statement bodies are
+    never buffered beyond the 8 MiB inspection cap.
+- **Streaming memory (flat)** — 4 × 32 MiB JSON pages through the
+  Trino-URL rewrite path allocated **≈ 1 MiB** of proxy memory total
+  (bounded-prefix rewrite + streamed remainder). Pages are never fully
+  buffered.
+
+## Security
+
+**Token handling.** query-guard is a transparent passthrough: `Authorization`
+and all `X-Trino-*` headers are mirrored 1:1 onto both the pre-flight request
+and the proxied client request. They are never decoded, validated, logged, or
+persisted. A regression test (`TestNoCredentialLogging`) asserts that
+credential header values never appear in log output on any handler path.
+
+**TLS topologies.** The proxy handles Bearer tokens, so every network leg
+should be encrypted. Supported options, in order of preference:
+
+1. **TLS on both legs (recommended).** Native TLS on the client→proxy leg
+   (see TLS above) *and* an `https://` Trino upstream URL (Trino supports
+   HTTPS natively via `http-server.https.enabled=true`). No plaintext anywhere.
+2. **Service mesh mTLS (Istio/Linkerd).** Fully supported — the mesh encrypts
+   both legs transparently; no query-guard configuration required.
+3. **Ingress/LB TLS termination.** Acceptable only when the pod network is a
+   trusted segment. Be aware that pod-to-pod traffic (including the Bearer
+   token) is plaintext on that segment and is capturable by a compromised
+   pod or node.
+
+**Fail-open semantics.** By design, query-guard fails open: if the parser
+fails, the pre-flight check times out, or an internal error occurs, the
+original query is forwarded rather than dropped. A safety tool must never
+cause platform downtime. The tradeoff: a crafted query that breaks the parser
+bypasses the guard. This is a recorded scope decision — see `NEXT_TASKS.md`
+(B6) and `progress.md` (Deferred Scope).
+
 ## Status
 
-See `progress.md` for the phase tracker.
+See `progress.md` for the phase tracker and `RUNBOOK.md` for operational
+guidance (metrics, alerts, incident procedures).
