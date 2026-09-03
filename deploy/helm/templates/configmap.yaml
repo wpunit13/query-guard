@@ -6,4 +6,15 @@ metadata:
     {{- include "query-guard.labels" . | nindent 4 }}
 data:
   policy.yaml: |
+{{- /*
+  The policy body comes from .Values.policy (a literal string; Helm does not
+  template inside values). TLS server settings cannot live in that string, so
+  they are appended here from .Values.tls when enabled. The tls.mountPath
+  must match the secret mount in deployment.yaml.
+*/}}
 {{ .Values.policy | indent 4 }}
+{{- if .Values.tls.enabled }}
+    tls:
+      cert_file: {{ .Values.tls.mountPath }}/tls.crt
+      key_file: {{ .Values.tls.mountPath }}/tls.key
+{{- end }}

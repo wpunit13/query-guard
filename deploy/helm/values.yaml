@@ -18,10 +18,27 @@ service:
   type: ClusterIP
   port: 8090
 
+# Native TLS on the query-guard listener. When enabled, the proxy serves
+# HTTPS only (no plaintext listener), so Authorization / X-Trino-* headers
+# are never transmitted in the clear. Certificate material comes from an
+# existing K8s Secret (type: kubernetes.io/tls) with keys tls.crt / tls.key;
+# the chart mounts it and passes the file paths via policy.yaml.
+tls:
+  enabled: false
+  # Name of a pre-existing Secret of type kubernetes.io/tls in the release
+  # namespace. The chart does not create it (certs are environment-specific;
+  # manage via cert-manager or your own process).
+  secretName: ""
+  # Mount path for the secret (cert_file/key_file paths in the policy derive
+  # from this; keep in sync with the policy block below).
+  mountPath: /etc/query-guard/tls
+
 # The query-guard HTTP listener port (server.port in policy.yaml).
 containerPort: 8090
 
 # Policy config shipped via a ConfigMap, mounted at /etc/query-guard/policy.yaml.
+# TLS server settings are NOT set here; when tls.enabled=true the chart appends
+# the server.tls block automatically (see templates/configmap.yaml).
 policy: |
   server:
     port: 8090

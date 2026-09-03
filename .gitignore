@@ -31,6 +31,9 @@ queryguard.log
 .qg-test/
 .qg-trino*/
 
+# Local Go build cache (sandbox workaround)
+.gocache/
+
 # Markdown docs — keep only README.md tracked
 *.md
 !README.md

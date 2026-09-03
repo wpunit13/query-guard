@@ -75,7 +75,7 @@ func main() {
 	addr := fmt.Sprintf(":%d", p.Server.Port)
 	srv := &http.Server{
 		Addr:         addr,
-		Handler:      handler,
+		Handler:      hstsHandler(handler, p.Server.TLS.Enabled()),
 		ReadTimeout:  p.Server.ReadTimeout,
 		WriteTimeout: p.Server.WriteTimeout,
 	}
@@ -85,9 +85,18 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		logger.Printf("query-guard listening on %s, proxying to %s", addr, p.Upstream.URL)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatalf("http server error: %v", err)
+		if p.Server.TLS.Enabled() {
+			// HTTPS-only: no plaintext listener exists, so Authorization and
+			// X-Trino-* headers are never transmitted unencrypted.
+			logger.Printf("query-guard listening on https://%s (TLS enabled), proxying to %s", addr, p.Upstream.URL)
+			if err := srv.ListenAndServeTLS(p.Server.TLS.CertFile, p.Server.TLS.KeyFile); err != nil && err != http.ErrServerClosed {
+				logger.Fatalf("https server error: %v", err)
+			}
+		} else {
+			logger.Printf("query-guard listening on http://%s (TLS disabled), proxying to %s", addr, p.Upstream.URL)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Fatalf("http server error: %v", err)
+			}
 		}
 	}()
 
@@ -101,4 +110,18 @@ func main() {
 		logger.Printf("shutdown error: %v", err)
 	}
 	logger.Printf("shutdown complete")
+}
+
+// hstsHandler wraps the root handler with a Strict-Transport-Security header
+// when TLS is enabled, so clients pin to HTTPS after the first response.
+// It is a no-op wrapper when TLS is disabled (HSTS over plaintext would break
+// HTTP clients without adding security).
+func hstsHandler(next http.Handler, tlsEnabled bool) http.Handler {
+	if !tlsEnabled {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		next.ServeHTTP(w, r)
+	})
 }

@@ -209,6 +209,60 @@ func TestStatementAllowedAndHeaderPassthrough(t *testing.T) {
 	}
 }
 
+// TestNoCredentialLogging verifies that Authorization and X-Trino-* header
+// values never appear in any log output across every handler path (allowed,
+// blocked, fail-open, bypass). A proxy that logs tokens defeats TLS entirely.
+func TestNoCredentialLogging(t *testing.T) {
+	const (
+		secretToken = "Bearer SUPER-SECRET-TOKEN-42"
+		trinoUser   = "secret-user-42"
+	)
+	headers := map[string]string{
+		"Authorization":       secretToken,
+		"X-Trino-User":        trinoUser,
+		"X-Trino-Catalog":     "secret-catalog-42",
+		"X-Trino-Schema":      "secret-schema-42",
+		"X-Trino-Session":     "secret-session-42",
+		"X-Trino-Client-Tags": "secret-tag-42",
+	}
+
+	cases := []struct {
+		name string
+		path string
+		body string
+		verb string
+		eval *fakeEvaluator
+	}{
+		{"allowed", statementPath, "SELECT * FROM orders", "POST", &fakeEvaluator{result: engine.CostResult{Allowed: true}}},
+		{"blocked-tier2", statementPath, "SELECT * FROM orders", "POST", &fakeEvaluator{result: engine.CostResult{Allowed: false, Reason: "too big"}}},
+		{"fail-open-evaluator-error", statementPath, "SELECT * FROM orders", "POST", &fakeEvaluator{err: engine.ErrPreflightConcurrency}},
+		{"bypass-statement", statementPath, "SHOW TABLES", "POST", &fakeEvaluator{}},
+		{"bypass-endpoint", "/v1/info", "", "GET", &fakeEvaluator{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logBuf strings.Builder
+			logger := log.New(&logBuf, "", 0)
+			h, _ := newTestHandler(t, testPolicy(), tc.eval)
+			h.logger = logger
+
+			rec := doRequest(h, tc.verb, tc.path, tc.body, headers)
+			_ = rec // response content is irrelevant here
+
+			logs := logBuf.String()
+			for _, secret := range []string{
+				secretToken, "SUPER-SECRET-TOKEN-42", trinoUser,
+				"secret-catalog-42", "secret-schema-42", "secret-session-42", "secret-tag-42",
+			} {
+				if strings.Contains(logs, secret) {
+					t.Errorf("log output contains credential %q:\n%s", secret, logs)
+				}
+			}
+		})
+	}
+}
+
 func TestStatementBlockedByTableBlocklist(t *testing.T) {
 	p := testPolicy()
 	p.Rules.TableBlocklist = []string{"blocked_tbl"}

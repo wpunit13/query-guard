@@ -8,8 +8,8 @@ spec:
   type: {{ .Values.service.type }}
   ports:
     - port: {{ .Values.service.port }}
-      targetPort: http
+      targetPort: {{ if .Values.tls.enabled }}https{{ else }}http{{ end }}
       protocol: TCP
-      name: http
+      name: {{ if .Values.tls.enabled }}https{{ else }}http{{ end }}
   selector:
     {{- include "query-guard.selectorLabels" . | nindent 4 }}

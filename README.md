@@ -172,12 +172,62 @@ helm template query-guard deploy/helm/ --set autoscaling.enabled=true
 The chart ships:
 - `templates/deployment.yaml` — probes on `/healthz` (liveness) and `/readyz`
   (readiness), policy mounted from a ConfigMap at `/etc/query-guard/policy.yaml`.
-- `templates/service.yaml` — points at the proxy HTTP port (`8090`).
+- `templates/service.yaml` — points at the proxy HTTP(S) port (`8090`).
 - `templates/configmap.yaml` — mounts the `policy.yaml` from `values.policy`.
 - `templates/hpa.yaml` — CPU-based autoscaling, disabled by default.
 
 Set the `upstream.url` in `values.yaml` → `policy` to point at your Trino
 coordinator service.
+
+### TLS
+
+Native TLS is built into the proxy. When `server.tls.cert_file` and
+`server.tls.key_file` are set, the listener serves **HTTPS only** — there is
+no plaintext listener, so `Authorization` and `X-Trino-*` headers are never
+transmitted unencrypted. An HSTS header (`max-age=31536000; includeSubDomains`)
+is sent on every response when TLS is enabled.
+
+In the Helm chart, enable it with an existing `kubernetes.io/tls` Secret:
+
+```bash
+helm install query-guard deploy/helm/ \
+  --set tls.enabled=true \
+  --set tls.secretName=query-guard-tls
+```
+
+The chart mounts the Secret at `/etc/query-guard/tls` and appends the
+`server.tls` block to the policy automatically. The Secret is not created by
+the chart — manage it with cert-manager or your own process. Certificate
+rotation is restart-based: update the Secret and restart the pods
+(`kubectl rollout restart`); the distroless image has no reload signal.
+
+## Security
+
+**Token handling.** query-guard is a transparent passthrough: `Authorization`
+and all `X-Trino-*` headers are mirrored 1:1 onto both the pre-flight request
+and the proxied client request. They are never decoded, validated, logged, or
+persisted. A regression test (`TestNoCredentialLogging`) asserts that
+credential header values never appear in log output on any handler path.
+
+**TLS topologies.** The proxy handles Bearer tokens, so every network leg
+should be encrypted. Supported options, in order of preference:
+
+1. **TLS on both legs (recommended).** Native TLS on the client→proxy leg
+   (see TLS above) *and* an `https://` Trino upstream URL (Trino supports
+   HTTPS natively via `http-server.https.enabled=true`). No plaintext anywhere.
+2. **Service mesh mTLS (Istio/Linkerd).** Fully supported — the mesh encrypts
+   both legs transparently; no query-guard configuration required.
+3. **Ingress/LB TLS termination.** Acceptable only when the pod network is a
+   trusted segment. Be aware that pod-to-pod traffic (including the Bearer
+   token) is plaintext on that segment and is capturable by a compromised
+   pod or node.
+
+**Fail-open semantics.** By design, query-guard fails open: if the parser
+fails, the pre-flight check times out, or an internal error occurs, the
+original query is forwarded rather than dropped. A safety tool must never
+cause platform downtime. The tradeoff: a crafted query that breaks the parser
+bypasses the guard. This is a recorded scope decision — see `NEXT_TASKS.md`
+(B6) and `progress.md` (Deferred Scope).
 
 ## Status
 
