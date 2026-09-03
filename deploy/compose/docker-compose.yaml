@@ -1,0 +1,48 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# query-guard test harness: Trino + query-guard proxy, both in Docker.
+#
+# Usage:
+#   docker compose -f deploy/compose/docker-compose.yaml up -d
+#   docker compose -f deploy/compose/docker-compose.yaml down
+#
+# Ports (host -> container):
+#   Trino      : 8082 -> 8080
+#   qg proxy   : 8091 -> 8090   (local scripts use :8090; 8091 avoids the
+#                                Docker Desktop reservation on 8080)
+# ──────────────────────────────────────────────────────────────────────────────
+services:
+  trino:
+    image: trinodb/trino:476
+    container_name: qg-trino
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./catalog:/etc/trino/catalog:ro
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - queryguard
+
+  query-guard:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    image: query-guard:harness
+    container_name: qg-proxy
+    depends_on:
+      trino:
+        condition: service_healthy
+    ports:
+      - "8091:8090"
+    volumes:
+      - ./policy.yaml:/etc/query-guard/policy.yaml:ro
+    networks:
+      - queryguard
+
+networks:
+  queryguard:
+    driver: bridge

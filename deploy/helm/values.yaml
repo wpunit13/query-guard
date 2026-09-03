@@ -1,0 +1,86 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# query-guard Helm chart values
+# ──────────────────────────────────────────────────────────────────────────────
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/your-org/query-guard
+  pullPolicy: IfNotPresent
+  # Overrides the Chart.yaml appVersion if set.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 8090
+
+# The query-guard HTTP listener port (server.port in policy.yaml).
+containerPort: 8090
+
+# Policy config shipped via a ConfigMap, mounted at /etc/query-guard/policy.yaml.
+policy: |
+  server:
+    port: 8090
+    read_timeout: 30s
+    write_timeout: 5m
+    shutdown_grace_period: 10s
+
+  upstream:
+    url: http://trino:8080
+    timeout: 30s
+
+  preflight:
+    timeout: 2s
+    max_concurrent: 5
+
+  rules:
+    table_blocklist:
+      - lineitem
+    required_filters: []
+    # example:
+    #   - catalog: tpch
+    #     schema: tiny
+    #     table: orders
+    #     column: orderdate
+    cost_limits:
+      - catalog: tpch
+        schema: tiny
+        table: orders
+        max_scan_bytes: 5000000
+        max_rows: 20000
+      - max_scan_bytes_per_query: 8000000
+
+  telemetry:
+    enabled: true
+    path: /metrics
+
+# Container resources.
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 64Mi
+
+# Liveness/readiness probe tuning.
+probes:
+  livenessInitialDelaySeconds: 5
+  livenessPeriodSeconds: 10
+  readinessInitialDelaySeconds: 5
+  readinessPeriodSeconds: 10
+
+# Horizontal Pod Autoscaling. Enable with `autoscaling.enabled=true`.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

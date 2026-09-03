@@ -26,7 +26,33 @@ go test ./...
 
 ## Local test-drive (Trino + proxy)
 
-`scripts/test-drive.sh` brings up a self-contained, reproducible environment:
+Two options:
+
+### Option A — fully Dockerized (no local Java/Trino needed)
+
+```bash
+scripts/docker-harness.sh start    # build image + start Trino & proxy in Docker
+scripts/docker-harness.sh status   # show status + health
+scripts/docker-harness.sh stop    # stop both containers
+```
+
+This runs both Trino (`trinodb/trino:476`) and query-guard as containers on a
+shared network. Query-guard references Trino by the compose service name, so no
+host networking is needed.
+
+To change the guard policy for the Dockerized stack, edit
+`deploy/compose/policy.yaml` — it is bind-mounted into the container and
+hot-reloads (no restart needed for rule/upstream changes).
+
+| Component | Address |
+|-----------|---------|
+| Trino (container) | `http://localhost:8082` |
+| query-guard proxy (container) | `http://localhost:8091` |
+
+### Option B — local processes (Java 25 + built binary)
+
+`scripts/test-drive.sh` brings up a self-contained environment using your local
+Java runtime:
 
 - a **latest Trino** coordinator (requires **Java 25**, Temurin recommended)
 - the **query-guard proxy** pointed at it
@@ -120,6 +146,38 @@ Guarded connection summary:
   `SELECT * FROM tpch.tiny.orders` (no `orderdate` filter) is blocked even though
   it is valid SQL on the `orders` table.
 - For a quick runnable example, see the TPCH queries in `internal/integration/`.
+
+## Health & readiness
+
+- `GET /healthz` — liveness probe. Always `200` while the process is up.
+- `GET /readyz` — readiness probe. `200` when the upstream is reachable,
+  `503` otherwise. Used by the Helm chart.
+
+## Deployment (Kubernetes/Helm)
+
+Build the image and lint the Helm chart:
+
+```bash
+docker build -t query-guard:local -f deploy/Dockerfile .
+helm lint deploy/helm/
+```
+
+Render and inspect the manifests:
+
+```bash
+helm template query-guard deploy/helm/
+helm template query-guard deploy/helm/ --set autoscaling.enabled=true
+```
+
+The chart ships:
+- `templates/deployment.yaml` — probes on `/healthz` (liveness) and `/readyz`
+  (readiness), policy mounted from a ConfigMap at `/etc/query-guard/policy.yaml`.
+- `templates/service.yaml` — points at the proxy HTTP port (`8090`).
+- `templates/configmap.yaml` — mounts the `policy.yaml` from `values.policy`.
+- `templates/hpa.yaml` — CPU-based autoscaling, disabled by default.
+
+Set the `upstream.url` in `values.yaml` → `policy` to point at your Trino
+coordinator service.
 
 ## Status
 

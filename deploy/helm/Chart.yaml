@@ -1,0 +1,15 @@
+apiVersion: v2
+name: query-guard
+description: A fail-open Layer 7 reverse proxy that guards Trino clusters from runaway queries.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - trino
+  - proxy
+  - sql
+  - query-guard
+  - guard
+maintainers:
+  - name: query-guard
+    email: wpunit13@gmail.com

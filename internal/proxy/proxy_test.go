@@ -383,3 +383,71 @@ func assertRejection(t *testing.T, rec *httptest.ResponseRecorder, wantReason Re
 		t.Errorf("reason = %q, want %q (body=%s)", resp.Reason, wantReason, rec.Body.String())
 	}
 }
+
+func TestRewriteTrinoURIs(t *testing.T) {
+	body := `{"id":"q1","infoUri":"http://trino:8080/ui/query.html?q1","nextUri":"http://trino:8080/v1/statement/queued/q1/1","partialCancelUri":"http://trino:8080/cancel","warnings":[]}`
+	req := httptest.NewRequest(http.MethodGet, "/v1/statement/queued/q1/1", nil)
+	req = req.WithContext(context.WithValue(req.Context(), clientHostKey{}, "localhost:8091"))
+	resp := &http.Response{
+		Request:    req,
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	if err := rewriteTrinoURIs(resp); err != nil {
+		t.Fatalf("rewriteTrinoURIs: %v", err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	s := string(out)
+
+	for _, want := range []string{
+		`"infoUri": "http://localhost:8091/ui/query.html?q1"`,
+		`"nextUri": "http://localhost:8091/v1/statement/queued/q1/1"`,
+		`"partialCancelUri": "http://localhost:8091/cancel"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("rewritten body missing %q; got: %s", want, s)
+		}
+	}
+	if strings.Contains(s, "trino:8080") {
+		t.Errorf("internal upstream host trino:8080 still present: %s", s)
+	}
+}
+
+func TestRewriteTrinoURIs_StreamsLargePage(t *testing.T) {
+	// Verify the streaming path: a page larger than rewritePrefixBytes still has
+	// its URLs rewritten in the prefix, and all data bytes are preserved in the
+	// streamed remainder.
+	const dataSize = rewritePrefixBytes + 10*1024
+	body := `{"id":"q","nextUri":"http://trino:8080/v1/statement/q/1","data":"` +
+		strings.Repeat("x", dataSize) + `"}`
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req = req.WithContext(context.WithValue(req.Context(), clientHostKey{}, "client:8091"))
+	resp := &http.Response{
+		Request:    req,
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	if err := rewriteTrinoURIs(resp); err != nil {
+		t.Fatalf("rewriteTrinoURIs: %v", err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	s := string(out)
+
+	// URL rewritten despite the large page.
+	if !strings.Contains(s, `"nextUri": "http://client:8091/v1/statement/q/1"`) {
+		t.Errorf("nextUri not rewritten on large page; got: %.120s", s)
+	}
+	// All data preserved through the streamed remainder.
+	if !strings.Contains(s, strings.Repeat("x", dataSize)) {
+		t.Errorf("large data payload not preserved through stream")
+	}
+	// No internal host leaks.
+	if strings.Contains(s, "trino:8080") {
+		t.Errorf("internal host still present on large page")
+	}
+}

@@ -1,0 +1,37 @@
+# Policy for the Docker Compose harness. The upstream points at the Trino
+# container by its compose service name (trino) on the shared network.
+server:
+  port: 8090
+  read_timeout: 30s
+  write_timeout: 5m
+  shutdown_grace_period: 10s
+
+upstream:
+  url: http://trino:8080
+  timeout: 30s
+
+preflight:
+  timeout: 2s
+  max_concurrent: 5
+
+rules:
+  table_blocklist:
+    - lineitem
+
+  required_filters:
+    - catalog: tpch
+      schema: tiny
+      table: orders
+      column: orderdate
+
+  cost_limits:
+    - catalog: tpch
+      schema: tiny
+      table: orders
+      max_scan_bytes: 100000
+      max_rows: 0
+    - max_scan_bytes_per_query: 8000000
+
+telemetry:
+  enabled: true
+  path: /metrics
