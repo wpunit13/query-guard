@@ -1,0 +1,40 @@
+# Build and attach release binaries to the GitHub Release for v*.*.* tags.
+#
+# Produces static linux binaries (amd64 + arm64) with SHA256 checksums so
+# consumers can build their own internal images from verified artifacts
+# instead of pulling published container images.
+#
+# Uses the built-in GITHUB_TOKEN — no secrets to configure.
+
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write # attach artifacts to the GitHub Release
+
+jobs:
+  binaries:
+    name: GoReleaser build & upload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # goreleaser works best with full history/tags
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

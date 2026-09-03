@@ -5,6 +5,8 @@
 replicaCount: 2
 
 image:
+  # Default assumes the image is published from this repo's release pipeline
+  # (ghcr.io/<owner>/query-guard). Override if you mirror it elsewhere.
   repository: ghcr.io/your-org/query-guard
   pullPolicy: IfNotPresent
   # Overrides the Chart.yaml appVersion if set.

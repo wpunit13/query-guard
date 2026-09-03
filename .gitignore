@@ -34,6 +34,9 @@ queryguard.log
 # Local Go build cache (sandbox workaround)
 .gocache/
 
+# GoReleaser local build output
+dist/
+
 # Markdown docs — keep only README.md tracked
 *.md
 !README.md

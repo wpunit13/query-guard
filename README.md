@@ -179,6 +179,41 @@ The chart ships:
 Set the `upstream.url` in `values.yaml` → `policy` to point at your Trino
 coordinator service.
 
+### Installing the chart from GHCR (OCI)
+
+Every release tag (`v*.*.*`) publishes the chart to GHCR as an OCI artifact,
+versioned to match the release:
+
+```bash
+# Pull the chart
+helm pull oci://ghcr.io/<owner>/query-guard/chart --version 1.0.1
+
+# Or install directly
+helm install query-guard oci://ghcr.io/<owner>/query-guard/chart \
+  --version 1.0.1 \
+  --set upstream.url=http://trino:8080
+```
+
+The chart version and `appVersion` are stamped from the git tag at package
+time — `Chart.yaml` in the repo is not bumped per release.
+
+### Installing from release binaries (no Docker / Go toolchain)
+
+Every release tag also publishes static linux binaries (amd64 + arm64) to
+the GitHub Release page, packaged with a default `policy.yaml` and a
+`checksums.txt`:
+
+```bash
+# Download from the release page, then verify and unpack:
+sha256sum -c checksums.txt
+tar xzf query-guard_<version>_linux_amd64.tar.gz
+./query-guard -config policy.yaml
+```
+
+These are ideal for consumers who build their own internal images from
+verified artifacts instead of pulling published container images — the
+archive contains the same distroless-compatible static binary the image uses.
+
 ### TLS
 
 Native TLS is built into the proxy. When `server.tls.cert_file` and
