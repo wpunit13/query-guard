@@ -18,19 +18,32 @@ rules:
   table_blocklist:
     - lineitem
 
+  # v1 feature verification
+  function_blocklist:
+    - regexp_count
+
+  select_star_blocked_tables:
+    - customer
+
   required_filters:
     - catalog: tpch
       schema: tiny
       table: orders
-      column: orderdate
+      mode: any-of
+      columns: [orderdate, shippriority]
 
   cost_limits:
     - catalog: tpch
       schema: tiny
       table: orders
-      max_scan_bytes: 100000
+      max_scan_bytes: 500000
       max_rows: 0
     - max_scan_bytes_per_query: 8000000
+      max_cpu_cost_per_query: 500000
+
+audit:
+  log_rejections: true
+  snapshot_plan: true
 
 telemetry:
   enabled: true

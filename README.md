@@ -5,15 +5,77 @@ cluster coordinator (initially Trino) and protects clusters from runaway queries
 by inspecting incoming SQL at `POST /v1/statement` through a two-tier evaluation:
 
 1. **Tier 1 (Static AST Filter):** in-memory check for table blocklists,
-   required partition filters, and statement classification.
-2. **Tier 2 (Pre-Flight Cost Check):** asynchronous shadow execution of
-   `EXPLAIN (TYPE IO, FORMAT JSON) <query>` to estimate scan bytes against
-   configured limits.
+   function/UDF blocklists, `SELECT *` restrictions, required partition
+   filters (any-of/all-of), and statement classification.
+2. **Tier 2 (Pre-Flight Cost Check):** shadow execution of
+   `EXPLAIN (TYPE IO, FORMAT JSON) <query>` to estimate scan bytes, rows, and
+   CPU cost against configured limits.
 
 Fail-open: if parsing, evaluation, or the pre-flight times out, the query is
 forwarded unchanged so the safety tool never causes platform downtime.
 
 ---
+
+## Policy reference
+
+All rules are **hot-reloadable** (edit `policy.yaml`, no restart),
+**case-insensitive** for unquoted identifiers, and **off unless configured**
+(empty/0/false = disabled). Full example:
+
+```yaml
+server:
+  port: 8090
+
+upstream:
+  url: http://trino:8080
+
+rules:
+  # Tables that may never be queried. Bare names match any catalog/schema.
+  table_blocklist:
+    - lineitem
+
+  # Functions/UDFs that may not appear anywhere in a statement
+  # (projections, WHERE, CTEs, subqueries).
+  function_blocklist:
+    - regexp_count
+
+  # Tables on which `SELECT *` is rejected; explicit column lists are fine.
+  # COUNT(*) is not a projection star and is never flagged.
+  select_star_blocked_tables:
+    - wide_table
+
+  # Required WHERE filters, scoped to exactly one schema.table
+  # (catalog optional; no bare-name/suffix matching).
+  required_filters:
+    - catalog: finance          # optional; empty = any catalog
+      schema: reporting
+      table: daily_orders
+      mode: any-of              # any-of | all-of (default all-of)
+      columns: [ds, month, year]
+
+  cost_limits:
+    # Table-scoped: scan bytes / rows for matching tables.
+    - catalog: tpch
+      schema: tiny
+      table: orders
+      max_scan_bytes: 100000
+      max_rows: 0               # 0 = disabled
+    # Query-global limits.
+    - max_scan_bytes_per_query: 8000000
+      max_cpu_cost_per_query: 500.0   # plan-root CPU estimate; 0 = disabled
+
+# Audit logging: one structured `audit_rejection` line per rejected query
+# (rejections only — allowed/bypassed queries are never audited). Identity
+# fields (user, client_tags) appear ONLY here, never in other logs;
+# Authorization values are never logged anywhere.
+audit:
+  log_rejections: true
+  snapshot_plan: true   # include Tier-2 cost estimates in the audit line
+```
+
+Rejection reasons returned in the JSON 400 body: `TABLE_BLOCKLIST`,
+`REQUIRED_FILTER_MISSING`, `STATEMENT_BLOCKLIST`, `COST_LIMIT_BREACH`,
+`FUNCTION_BLOCKLIST`, `SELECT_STAR_BLOCKED`.
 
 ## Running the code
 

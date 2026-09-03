@@ -18,6 +18,14 @@ query being **forwarded unguarded**. Consequences for operations:
 - Silence is not health. A guard that rejects nothing may be broken, not
   peaceful.
 
+## Rejection reasons
+
+The JSON 400 body's `reason` field identifies the enforcing rule:
+`TABLE_BLOCKLIST`, `REQUIRED_FILTER_MISSING` (any-of/all-of required
+filters), `STATEMENT_BLOCKLIST`, `COST_LIMIT_BREACH` (scan bytes, rows, or
+CPU cost), `FUNCTION_BLOCKLIST` (blocked function/UDF), `SELECT_STAR_BLOCKED`
+(`SELECT *` on a restricted table).
+
 ## Metrics reference
 
 All metrics are exported at `GET /metrics` (path configurable via
@@ -96,6 +104,37 @@ To trace a rejected or failed-open query: ask the user/tooling for the
 `request_id` from the 400 response (or have clients send `X-Request-ID`),
 then grep the guard's logs for it.
 
+## Audit logging (opt-in)
+
+With `audit.log_rejections: true`, every rejected query emits one
+`audit_rejection` log line containing the verbatim query, rejection reason,
+referenced tables, WHERE columns, **user** (`X-Trino-User`) and
+**client_tags** (`X-Trino-Client-Tags`), and the request ID. With
+`audit.snapshot_plan: true`, Tier-2 rejections additionally include the cost
+snapshot (estimated bytes/rows/CPU and per-table scans).
+
+Scope rules (see README → Security):
+- Rejections only — allowed and bypassed queries are never audited.
+- Identity fields appear **only** in these opt-in records, never in other logs.
+- `Authorization` values are **never** logged anywhere, audit lines included.
+- `log_rejections`/`snapshot_plan` are hot-reloadable.
+
+Use the audit stream for investigations: who ran (or attempted) the blocked
+query, against which tables, and (for Tier 2) how expensive it would have
+been.
+
+## CPU cost cap
+
+`max_cpu_cost_per_query` enforces a global per-query cap using the plan's
+**root** CPU estimate (`estimate.cpuCost` from the EXPLAIN I/O plan). Notes:
+
+- It is global-only — CPU is not attributable per-table across joins.
+- Many plans carry no CPU estimate; the limit then **fails open** (a warning
+  is logged, the query is evaluated on the other limits only). Watch for the
+  warning `max_cpu_cost_per_query configured but the plan carries no CPU cost
+  estimate` — sustained growth means the CPU cap is largely inert for your
+  workload.
+
 ## Config hot-reload
 
 `policy.yaml` reloads automatically on file change (fsnotify, debounced).
@@ -106,6 +145,12 @@ reverse proxy if `upstream.url` changed.
   parse or validate, the previous config stays active and
   `config watcher reload error` is logged. Users keep running under the old
   policy — check the logs after any intended policy change.
+- **⚠️ Single-file bind mounts break hot-reload:** if `policy.yaml` is
+  bind-mounted as an individual file (as in `deploy/compose`), many editors
+  save via rename → the container holds the stale inode and fsnotify never
+  fires; edits appear to be ignored. Restart the container after editing, or
+  mount the containing **directory** instead (Kubernetes ConfigMaps already
+  use symlinked directories, so the Helm deployment hot-reloads correctly).
 - **Adding a rule safely:** edit a copy, validate it with the binary or a
   test load (`config.Load` rejects invalid policies at startup), then move it
   into place. Watch `queries_total{status="blocked"}` (alert #5) afterwards.

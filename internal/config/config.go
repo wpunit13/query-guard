@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"sync"
@@ -20,6 +21,18 @@ type Policy struct {
 	Preflight PreflightConfig `yaml:"preflight"`
 	Rules     RulesConfig     `yaml:"rules"`
 	Telemetry TelemetryConfig `yaml:"telemetry"`
+	Audit     AuditConfig     `yaml:"audit"`
+}
+
+// AuditConfig controls opt-in audit logging of rejected queries.
+type AuditConfig struct {
+	// LogRejections enables one structured audit log line per rejected
+	// query (rejections only; allowed/bypassed queries are never audited).
+	LogRejections bool `yaml:"log_rejections"`
+	// SnapshotPlan includes the Tier-2 cost snapshot (estimated bytes,
+	// rows, CPU cost, per-table scans) in the audit line for Tier-2
+	// rejections. Has no effect unless LogRejections is true.
+	SnapshotPlan bool `yaml:"snapshot_plan"`
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -66,17 +79,32 @@ type RulesConfig struct {
 	RequiredFilters    []RequiredFilter `yaml:"required_filters"`
 	CostLimits         []CostLimit      `yaml:"cost_limits"`
 	StatementBlocklist []string         `yaml:"statement_blocklist"`
+	// FunctionBlocklist lists function/UDF names (case-insensitive) that may
+	// not appear anywhere in a statement. Empty = disabled.
+	FunctionBlocklist []string `yaml:"function_blocklist"`
+	// SelectStarBlockedTables lists tables on which `SELECT *` is rejected
+	// (case-insensitive; explicit column lists are fine). Empty = disabled.
+	SelectStarBlockedTables []string `yaml:"select_star_blocked_tables"`
 }
 
-// RequiredFilter enforces that a specific column appears in the WHERE clause.
+// RequiredFilter enforces that specific columns appear in the WHERE clause
+// of queries against a specific schema.table.
 type RequiredFilter struct {
+	// Catalog is optional; empty matches any catalog.
 	Catalog string `yaml:"catalog"`
-	Schema  string `yaml:"schema"`
-	Table   string `yaml:"table"`
-	Column  string `yaml:"column"`
+	// Schema and Table are required: the entry applies only to that exact
+	// schema.table (no suffix/bare-name matching).
+	Schema string `yaml:"schema"`
+	Table  string `yaml:"table"`
+	// Mode is "any-of" (at least one column filtered) or "all-of" (all
+	// columns filtered). Empty defaults to all-of.
+	Mode string `yaml:"mode"`
+	// Columns lists the column names that must be filtered on, attributed
+	// to this specific table.
+	Columns []string `yaml:"columns"`
 }
 
-// CostLimit defines maximum scan bytes and/or rows per table scope.
+// CostLimit defines maximum scan bytes, rows, and CPU cost per scope.
 type CostLimit struct {
 	Catalog              string `yaml:"catalog"`
 	Schema               string `yaml:"schema"`
@@ -84,6 +112,10 @@ type CostLimit struct {
 	MaxScanBytes         int64  `yaml:"max_scan_bytes"`
 	MaxRows              int64  `yaml:"max_rows"`
 	MaxScanBytesPerQuery int64  `yaml:"max_scan_bytes_per_query"`
+	// MaxCPUCostPerQuery is a global per-query cap on the estimated CPU cost
+	// from the EXPLAIN plan's root estimate. Global-only: CPU is not
+	// attributable per-table across joins. 0 = disabled.
+	MaxCPUCostPerQuery float64 `yaml:"max_cpu_cost_per_query"`
 }
 
 // TelemetryConfig controls observability endpoints.
@@ -134,7 +166,12 @@ func Load(path string) (*Policy, error) {
 	}
 
 	var p Policy
-	if err := yaml.Unmarshal(data, &p); err != nil {
+	// Strict decode: unknown fields (including the removed singular `column`
+	// of required_filters) fail loudly instead of silently degrading —
+	// important because the required_filters schema change is breaking.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&p); err != nil {
 		return nil, fmt.Errorf("config: YAML parse error in %q: %w", path, err)
 	}
 
@@ -195,6 +232,32 @@ func (p *Policy) Validate() error {
 	for _, lim := range p.Rules.CostLimits {
 		if lim.MaxScanBytes < 0 || lim.MaxRows < 0 || lim.MaxScanBytesPerQuery < 0 {
 			return fmt.Errorf("cost limit values must be >= 0 (0 disables the limit), got %+v", lim)
+		}
+		if lim.MaxCPUCostPerQuery < 0 {
+			return fmt.Errorf("max_cpu_cost_per_query must be >= 0 (0 disables the limit), got %v", lim.MaxCPUCostPerQuery)
+		}
+	}
+
+	// Required filters: schema+table scoping is mandatory (breaking change
+	// from the old suffix-matched singular-column form), mode is restricted,
+	// and at least one column must be listed.
+	for i, rf := range p.Rules.RequiredFilters {
+		if rf.Schema == "" || rf.Table == "" {
+			return fmt.Errorf("required_filters[%d]: schema and table are required (entry matches exactly one schema.table)", i)
+		}
+		switch rf.Mode {
+		case "", "any-of", "all-of":
+			// valid; empty mode defaults to all-of at enforcement time
+		default:
+			return fmt.Errorf("required_filters[%d]: mode must be \"any-of\" or \"all-of\" (or empty for all-of), got %q", i, rf.Mode)
+		}
+		if len(rf.Columns) == 0 {
+			return fmt.Errorf("required_filters[%d]: at least one entry in columns is required", i)
+		}
+		for _, c := range rf.Columns {
+			if c == "" {
+				return fmt.Errorf("required_filters[%d]: columns must not contain empty names", i)
+			}
 		}
 	}
 

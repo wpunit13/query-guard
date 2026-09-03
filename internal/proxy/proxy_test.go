@@ -209,9 +209,13 @@ func TestStatementAllowedAndHeaderPassthrough(t *testing.T) {
 	}
 }
 
-// TestNoCredentialLogging verifies that Authorization and X-Trino-* header
-// values never appear in any log output across every handler path (allowed,
-// blocked, fail-open, bypass). A proxy that logs tokens defeats TLS entirely.
+// TestNoCredentialLogging verifies credential handling in logs:
+//   - Authorization values (Bearer tokens) NEVER appear in any log output on
+//     any handler path — including opt-in audit lines (see TestAudit). This
+//     is the absolute guarantee from the TLS hardening work.
+//   - Identity header values (X-Trino-User etc.) never appear in normal log
+//     output; they may appear ONLY in opt-in audit records (Feature D), and
+//     audit is disabled in these cases, so their absence is asserted here too.
 func TestNoCredentialLogging(t *testing.T) {
 	const (
 		secretToken = "Bearer SUPER-SECRET-TOKEN-42"
@@ -318,6 +322,364 @@ func TestRequestIDCorrelation(t *testing.T) {
 	}
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Feature B — function blocklist enforcement
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestFunctionBlocked(t *testing.T) {
+	p := testPolicy()
+	p.Rules.FunctionBlocklist = []string{"regexp_count"}
+	h, u := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT regexp_count(name, 'x') FROM orders", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonFunctionBlocklist)
+	// Rejected: must NOT reach upstream.
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("blocked query reached upstream: %q", body)
+	}
+}
+
+func TestFunctionBlocked_InWhere(t *testing.T) {
+	p := testPolicy()
+	p.Rules.FunctionBlocklist = []string{"regexp_extract"}
+	h, _ := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM orders WHERE regexp_extract(name, 'x') = 'y'", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	assertRejection(t, rec, ReasonFunctionBlocklist)
+}
+
+func TestFunctionBlocked_CaseInsensitive(t *testing.T) {
+	p := testPolicy()
+	p.Rules.FunctionBlocklist = []string{"regexp_count"}
+	h, _ := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT REGEXP_COUNT(name, 'x') FROM orders", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (case-insensitive match)", rec.Code)
+	}
+}
+
+func TestFunctionBlocked_Nested(t *testing.T) {
+	p := testPolicy()
+	p.Rules.FunctionBlocklist = []string{"regexp_extract"}
+	h, _ := newTestHandler(t, p, nil)
+
+	// Function nested inside another function call.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT lower(regexp_extract(name, 'x')) FROM orders", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (nested function)", rec.Code)
+	}
+}
+
+func TestFunctionAllowed_WhenNotBlocklisted(t *testing.T) {
+	p := testPolicy()
+	p.Rules.FunctionBlocklist = []string{"regexp_count"}
+	h, u := newTestHandler(t, p, nil) // nil evaluator → tier2 skipped
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT regexp_extract(name, 'x') FROM orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u.snapshot(); !strings.Contains(body, "regexp_extract") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Feature C — SELECT * restriction enforcement
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestSelectStarBlocked(t *testing.T) {
+	p := testPolicy()
+	p.Rules.SelectStarBlockedTables = []string{"wide_table"}
+	h, u := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM hive.analytics.wide_table", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonSelectStarBlocked)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("blocked query reached upstream: %q", body)
+	}
+
+	// Bare table name matches the trailing component (consistent with blocklist).
+	rec = doRequest(h, http.MethodPost, statementPath, "SELECT * FROM wide_table", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bare-name star: status = %d, want 400", rec.Code)
+	}
+}
+
+func TestSelectStarBlocked_ExplicitColumnsAllowed(t *testing.T) {
+	p := testPolicy()
+	p.Rules.SelectStarBlockedTables = []string{"wide_table"}
+	h, u := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT id, name FROM hive.analytics.wide_table", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u.snapshot(); !strings.Contains(body, "wide_table") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+}
+
+func TestSelectStarBlocked_CountStarAllowed(t *testing.T) {
+	p := testPolicy()
+	p.Rules.SelectStarBlockedTables = []string{"wide_table"}
+	h, _ := newTestHandler(t, p, nil)
+
+	// COUNT(*) is an aggregate argument, not a projection star.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT COUNT(*) FROM hive.analytics.wide_table", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSelectStarBlocked_OtherTablesUnaffected(t *testing.T) {
+	p := testPolicy()
+	p.Rules.SelectStarBlockedTables = []string{"wide_table"}
+	h, _ := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM other_table", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Feature D — audit logging (rejections only, strictly opt-in)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// newAuditHarness builds a blocked-query harness with a captured slog output.
+func newAuditHarness(t *testing.T, audit, snapshot bool) (*Handler, *strings.Builder) {
+	p := testPolicy()
+	p.Rules.TableBlocklist = []string{"blocked_tbl"}
+	p.Audit.LogRejections = audit
+	p.Audit.SnapshotPlan = snapshot
+	var logBuf strings.Builder
+	h, _ := newTestHandler(t, p, nil)
+	h.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+	return h, &logBuf
+}
+
+func TestAuditRejection_Tier1(t *testing.T) {
+	h, logs := newAuditHarness(t, true, false)
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM blocked_tbl", map[string]string{
+		"X-Trino-User":        "alice",
+		"X-Trino-Client-Tags": "reporting,batch",
+		"Authorization":       "Bearer DO-NOT-LOG",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "audit_rejection") {
+		t.Fatalf("expected audit line in logs:\n%s", out)
+	}
+	for _, want := range []string{
+		`query="SELECT * FROM blocked_tbl"`,
+		`reason=TABLE_BLOCKLIST`,
+		`user=alice`,
+		`client_tags=reporting,batch`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("audit line missing %q:\n%s", want, out)
+		}
+	}
+	// Option A: Authorization values NEVER appear — audit lines included.
+	if strings.Contains(out, "DO-NOT-LOG") {
+		t.Errorf("Authorization value leaked into audit line:\n%s", out)
+	}
+	// snapshot only for tier-2 rejections.
+	if strings.Contains(out, "snapshot=") {
+		t.Errorf("tier-1 audit line must not contain a snapshot:\n%s", out)
+	}
+}
+
+func TestAuditRejection_DisabledByDefault(t *testing.T) {
+	h, logs := newAuditHarness(t, false, false)
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM blocked_tbl", map[string]string{
+		"X-Trino-User": "alice",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if strings.Contains(logs.String(), "audit_rejection") {
+		t.Errorf("audit line emitted with log_rejections=false:\n%s", logs.String())
+	}
+	// Identity also stays out of normal logs (audit off).
+	if strings.Contains(logs.String(), "alice") {
+		t.Errorf("identity value in non-audit log:\n%s", logs.String())
+	}
+}
+
+func TestAuditRejection_Tier2Snapshot(t *testing.T) {
+	// Tier-2 rejection: blocked by cost limit. Snapshot on vs off.
+	build := func(snapshot bool) (*Handler, *strings.Builder) {
+		p := testPolicy()
+		p.Audit.LogRejections = true
+		p.Audit.SnapshotPlan = snapshot
+		var logBuf strings.Builder
+		h, _ := newTestHandler(t, p, &fakeEvaluator{
+			result: engine.CostResult{
+				Allowed:            false,
+				Reason:             "estimated scan bytes 20000000 exceeds per-query limit 10000000",
+				EstimatedScanBytes: 20_000_000,
+				EstimatedRows:      10_000,
+				EstimatedCPUCost:   42.5,
+				TableScans:         []engine.TableScan{{Table: "hive.default.orders", ScanBytes: 20_000_000, Rows: 10_000}},
+				Engine:             "fake",
+			},
+		})
+		h.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+		return h, &logBuf
+	}
+
+	h, logs := build(true)
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM orders", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "audit_rejection") {
+		t.Fatalf("expected audit line:\n%s", out)
+	}
+	for _, want := range []string{"snapshot=", "estimated_bytes:20000000", "estimated_rows:10000", "estimated_cpu:42.5", "hive.default.orders"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("tier-2 audit snapshot missing %q:\n%s", want, out)
+		}
+	}
+
+	h2, logs2 := build(false)
+	rec2 := doRequest(h2, http.MethodPost, statementPath, "SELECT * FROM orders", nil)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec2.Code)
+	}
+	if strings.Contains(logs2.String(), "snapshot=") {
+		t.Errorf("snapshot emitted with snapshot_plan=false:\n%s", logs2.String())
+	}
+}
+
+func TestAudit_AllowedAndBypassedNotAudited(t *testing.T) {
+	p := testPolicy()
+	p.Audit.LogRejections = true
+	var logBuf strings.Builder
+	h, _ := newTestHandler(t, p, nil)
+	h.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	// Allowed query.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT id FROM orders", map[string]string{"X-Trino-User": "alice"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("allowed query: status = %d, want 200", rec.Code)
+	}
+	// Bypass statement.
+	rec = doRequest(h, http.MethodPost, statementPath, "SHOW TABLES", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bypass: status = %d, want 200", rec.Code)
+	}
+	if strings.Contains(logBuf.String(), "audit_rejection") {
+		t.Errorf("audit line emitted for non-rejection:\n%s", logBuf.String())
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Feature E — required-filter modes and scoping
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestRequiredFilter_AnyOf(t *testing.T) {
+	p := testPolicy()
+	p.Rules.RequiredFilters = []config.RequiredFilter{
+		{Schema: "analytics", Table: "orders", Mode: "any-of", Columns: []string{"ds", "month", "year"}},
+	}
+	h, _ := newTestHandler(t, p, nil)
+
+	// One of the columns filtered → allowed.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM analytics.orders WHERE ds = '2024-01-01'", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("any-of satisfied: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	// None of the columns filtered → rejected.
+	rec = doRequest(h, http.MethodPost, statementPath, "SELECT * FROM analytics.orders WHERE x = 1", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("any-of unsatisfied: status = %d, want 400", rec.Code)
+	}
+	assertRejection(t, rec, ReasonRequiredFilter)
+}
+
+func TestRequiredFilter_AllOf(t *testing.T) {
+	p := testPolicy()
+	p.Rules.RequiredFilters = []config.RequiredFilter{
+		{Schema: "analytics", Table: "orders", Columns: []string{"ds", "month"}}, // empty mode = all-of
+	}
+	h, _ := newTestHandler(t, p, nil)
+
+	// Both columns → allowed.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM analytics.orders WHERE ds = 1 AND month = 2", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("all-of satisfied: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	// Partial → rejected.
+	rec = doRequest(h, http.MethodPost, statementPath, "SELECT * FROM analytics.orders WHERE ds = 1", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("all-of partial: status = %d, want 400", rec.Code)
+	}
+	// Message lists the missing column.
+	if !strings.Contains(rec.Body.String(), "month") {
+		t.Errorf("rejection message should name the missing column: %s", rec.Body.String())
+	}
+}
+
+func TestRequiredFilter_SchemaScoped(t *testing.T) {
+	p := testPolicy()
+	p.Rules.RequiredFilters = []config.RequiredFilter{
+		{Schema: "reporting", Table: "daily_orders", Columns: []string{"ds"}},
+	}
+	h, _ := newTestHandler(t, p, nil)
+
+	// Same table name, different schema → the entry does NOT apply.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT id FROM other.daily_orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("schema scoping: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	// Catalog mismatch also does not apply.
+	rec = doRequest(h, http.MethodPost, statementPath, "SELECT id FROM finance.other.daily_orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog-free entry matches any catalog: status = %d, want 200", rec.Code)
+	}
+	// Exact schema.table match without filter → rejected.
+	rec = doRequest(h, http.MethodPost, statementPath, "SELECT id FROM reporting.daily_orders", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("exact match: status = %d, want 400", rec.Code)
+	}
+}
+
+func TestRequiredFilter_SingleColumnModesEquivalent(t *testing.T) {
+	for _, mode := range []string{"any-of", "all-of", ""} {
+		p := testPolicy()
+		p.Rules.RequiredFilters = []config.RequiredFilter{
+			{Schema: "analytics", Table: "orders", Mode: mode, Columns: []string{"ds"}},
+		}
+		h, _ := newTestHandler(t, p, nil)
+
+		rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM analytics.orders WHERE ds = 1", nil)
+		if rec.Code != http.StatusOK {
+			t.Errorf("mode %q satisfied: status = %d, want 200", mode, rec.Code)
+		}
+		rec = doRequest(h, http.MethodPost, statementPath, "SELECT * FROM analytics.orders WHERE x = 1", nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("mode %q unsatisfied: status = %d, want 400", mode, rec.Code)
+		}
+	}
+}
+
 func TestStatementBlockedByTableBlocklist(t *testing.T) {
 	p := testPolicy()
 	p.Rules.TableBlocklist = []string{"blocked_tbl"}
@@ -334,7 +696,7 @@ func TestStatementBlockedByTableBlocklist(t *testing.T) {
 func TestStatementBlockedMissingRequiredFilter(t *testing.T) {
 	p := testPolicy()
 	p.Rules.RequiredFilters = []config.RequiredFilter{
-		{Catalog: "hive", Schema: "analytics", Table: "orders", Column: "partition_dt"},
+		{Catalog: "hive", Schema: "analytics", Table: "orders", Columns: []string{"partition_dt"}},
 	}
 	h, u := newTestHandler(t, p, nil)
 
@@ -356,7 +718,7 @@ func TestStatementBlockedMissingRequiredFilter(t *testing.T) {
 func TestRequiredFilter_NotSatisfiedByOtherTable(t *testing.T) {
 	p := testPolicy()
 	p.Rules.RequiredFilters = []config.RequiredFilter{
-		{Catalog: "hive", Schema: "analytics", Table: "orders", Column: "orderdate"},
+		{Catalog: "hive", Schema: "analytics", Table: "orders", Columns: []string{"orderdate"}},
 	}
 	h, u := newTestHandler(t, p, nil)
 

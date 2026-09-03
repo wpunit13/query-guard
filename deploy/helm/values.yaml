@@ -64,7 +64,8 @@ policy: |
     #   - catalog: tpch
     #     schema: tiny
     #     table: orders
-    #     column: orderdate
+    #     mode: any-of          # or all-of (default)
+    #     columns: [orderdate]
     cost_limits:
       - catalog: tpch
         schema: tiny

@@ -145,16 +145,17 @@ func (e *TrinoEvaluator) Evaluate(ctx context.Context, query string, headers htt
 		return result, fmt.Errorf("engine/trino: preflight statement: %w", err)
 	}
 
-	scanBytes, rows, scans, err := parsePlanCells(cells)
+	scanBytes, rows, scans, cpuCost, err := parsePlanCells(cells)
 	if err != nil {
 		return result, fmt.Errorf("engine/trino: parse plan: %w", err)
 	}
 
 	result.EstimatedScanBytes = scanBytes
 	result.EstimatedRows = rows
+	result.EstimatedCPUCost = cpuCost
 	result.TableScans = scans
 
-	result.Allowed, result.Reason = e.evaluateLimits(ctx, scanBytes, rows, scans)
+	result.Allowed, result.Reason = e.evaluateLimits(ctx, scanBytes, rows, scans, cpuCost)
 	return result, nil
 }
 
@@ -252,7 +253,7 @@ func (e *TrinoEvaluator) runStatement(ctx context.Context, startURI, method, bod
 
 // evaluateLimits checks estimated usage against the configured cost limits.
 // It returns (allowed, reason). A non-empty reason explains a rejection.
-func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, totalRows int64, scans []TableScan) (bool, string) {
+func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, totalRows int64, scans []TableScan, cpuCost float64) (bool, string) {
 	p := e.cfg.Get()
 
 	// Detect table-scoped limits that cannot be enforced because the plan
@@ -270,11 +271,31 @@ func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, tot
 			slog.String("request_id", ctxlog.FromContext(ctx)))
 	}
 
+	// CPU-cost limits cannot be enforced when the plan carries no CPU
+	// estimate (0/absent) — same inert-limit pattern as table limits.
+	hasCPULimit := false
+	for _, lim := range p.Rules.CostLimits {
+		if lim.MaxCPUCostPerQuery > 0 {
+			hasCPULimit = true
+			break
+		}
+	}
+	if hasCPULimit && cpuCost <= 0 {
+		e.logger.Warn("max_cpu_cost_per_query configured but the plan carries no CPU cost estimate; CPU limit is not enforced",
+			slog.String("request_id", ctxlog.FromContext(ctx)))
+	}
+
 	for _, lim := range p.Rules.CostLimits {
 		// Query-level global limit.
 		if lim.MaxScanBytesPerQuery > 0 && totalScanBytes > lim.MaxScanBytesPerQuery {
 			return false, fmt.Sprintf("estimated scan bytes %d exceeds per-query limit %d",
 				totalScanBytes, lim.MaxScanBytesPerQuery)
+		}
+
+		// Global per-query CPU cost cap (root estimate; not per-table).
+		if lim.MaxCPUCostPerQuery > 0 && cpuCost > lim.MaxCPUCostPerQuery {
+			return false, fmt.Sprintf("estimated cpu cost %g exceeds limit %g",
+				cpuCost, lim.MaxCPUCostPerQuery)
 		}
 
 		// Table-scoped limits require a matching scanned table.
@@ -363,17 +384,17 @@ var (
 // parseTrinoIOPlan extracts estimates from a plan body. Kept for tests that
 // model a plan returned directly (no Trino protocol envelope); production code
 // uses parsePlanCells on the data cells collected from the nextUri chain.
-func parseTrinoIOPlan(body []byte) (scanBytes, rows int64, scans []TableScan, err error) {
+func parseTrinoIOPlan(body []byte) (scanBytes, rows int64, scans []TableScan, cpuCost float64, err error) {
 	return parsePlanCells([]string{string(body)})
 }
 
 // parsePlanCells aggregates estimates across one or more plan JSON documents
 // (each is a data cell harvested from Trino's EXPLAIN IO output).
-func parsePlanCells(cells []string) (scanBytes, rows int64, scans []TableScan, err error) {
+func parsePlanCells(cells []string) (scanBytes, rows int64, scans []TableScan, cpuCost float64, err error) {
 	agg := &planAggregate{scans: make(map[string]*TableScan)}
 	for _, c := range cells {
 		if err := parsePlanDoc([]byte(c), agg); err != nil {
-			return 0, 0, nil, err
+			return 0, 0, nil, 0, err
 		}
 	}
 
@@ -382,7 +403,7 @@ func parsePlanCells(cells []string) (scanBytes, rows int64, scans []TableScan, e
 		scans = append(scans, *s)
 	}
 
-	return agg.scanBytes, agg.rows, scans, nil
+	return agg.scanBytes, agg.rows, scans, agg.cpuCost, nil
 }
 
 // parsePlanDoc walks a single plan document accumulating estimates into agg.
@@ -395,6 +416,8 @@ func parsePlanCells(cells []string) (scanBytes, rows int64, scans []TableScan, e
 func parsePlanDoc(body []byte, agg *planAggregate) error {
 	var io trinoIOPlan
 	if err := json.Unmarshal(body, &io); err == nil && len(io.InputTableColumnInfos) > 0 {
+		// Root/query-total CPU cost (sibling of inputTableColumnInfos).
+		agg.cpuCost += io.Estimate.CPUCost
 		for _, info := range io.InputTableColumnInfos {
 			name := qualifiedTable(info.Table.Catalog, info.Table.SchemaTable.Schema, info.Table.SchemaTable.Table)
 			// Trino reports these as floats; truncate to int64. Acceptable for
@@ -443,6 +466,10 @@ func parsePlanDoc(body []byte, agg *planAggregate) error {
 // trinoIOPlan models Trino's EXPLAIN (TYPE IO, FORMAT JSON) output.
 type trinoIOPlan struct {
 	InputTableColumnInfos []trinoTableColumnInfo `json:"inputTableColumnInfos"`
+	// Estimate is the root/query-total estimate, sibling of
+	// inputTableColumnInfos. Its cpuCost is the only CPU signal Trino
+	// exposes, and it is not attributable per-table.
+	Estimate trinoEstimate `json:"estimate"`
 }
 
 type trinoTableColumnInfo struct {
@@ -459,6 +486,7 @@ type trinoTableColumnInfo struct {
 type trinoEstimate struct {
 	OutputRowCount    float64 `json:"outputRowCount"`
 	OutputSizeInBytes float64 `json:"outputSizeInBytes"`
+	CPUCost           float64 `json:"cpuCost"`
 }
 
 // qualifiedTable joins a catalog/schema/table into a dotted name, omitting
@@ -477,6 +505,7 @@ func qualifiedTable(catalog, schema, table string) string {
 type planAggregate struct {
 	scanBytes int64
 	rows      int64
+	cpuCost   float64
 	scans     map[string]*TableScan
 }
 

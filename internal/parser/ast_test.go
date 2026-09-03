@@ -243,6 +243,107 @@ func TestAnalyze_TruncateTable(t *testing.T) {
 	}
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Feature B — function collection
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestAnalyze_Functions(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "projection function",
+			sql:  "SELECT regexp_count(name, 'x') FROM t",
+			want: []string{"regexp_count"},
+		},
+		{
+			name: "where function",
+			sql:  "SELECT * FROM t WHERE regexp_extract(name, 'x') = 'y'",
+			want: []string{"regexp_extract"},
+		},
+		{
+			name: "uppercase lowercased",
+			sql:  "SELECT REGEXP_COUNT(name, 'x') FROM t",
+			want: []string{"regexp_count"},
+		},
+		{
+			name: "nested functions",
+			sql:  "SELECT lower(regexp_extract(name, 'x')) FROM t",
+			want: []string{"lower", "regexp_extract"},
+		},
+		{
+			name: "function inside CTE",
+			sql:  "WITH c AS (SELECT regexp_count(name, 'x') AS n FROM t) SELECT n FROM c",
+			want: []string{"regexp_count"},
+		},
+		{
+			name: "no functions",
+			sql:  "SELECT name FROM t WHERE id = 1",
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := Analyze(tc.sql)
+			if err != nil {
+				t.Fatalf("Analyze() unexpected error: %v", err)
+			}
+			if len(r.Functions) != len(tc.want) {
+				t.Fatalf("Functions = %v, want %v", r.Functions, tc.want)
+			}
+			for i, w := range tc.want {
+				if r.Functions[i] != w {
+					t.Errorf("Functions = %v, want %v", r.Functions, tc.want)
+					break
+				}
+			}
+		})
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Feature C — SelectAll detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestAnalyze_SelectAll(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want bool
+	}{
+		{name: "select star", sql: "SELECT * FROM t", want: true},
+		{name: "qualified star", sql: "SELECT a.* FROM a JOIN b ON a.id = b.id", want: true},
+		{name: "count star not flagged", sql: "SELECT COUNT(*) FROM t", want: false},
+		{name: "explicit columns", sql: "SELECT id, name FROM t", want: false},
+		{name: "mixed star and column", sql: "SELECT *, id FROM t", want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := Analyze(tc.sql)
+			if err != nil {
+				t.Fatalf("Analyze() unexpected error: %v", err)
+			}
+			if r.SelectAll != tc.want {
+				t.Errorf("SelectAll = %v, want %v", r.SelectAll, tc.want)
+			}
+		})
+	}
+}
+
+func TestAnalyze_SelectAll_Subquery(t *testing.T) {
+	// A star inside a FROM-subquery is still a projection-level star of the
+	// inner select, so it must be flagged.
+	r, err := Analyze("SELECT id FROM (SELECT * FROM t) sub")
+	if err != nil {
+		t.Fatalf("Analyze() unexpected error: %v", err)
+	}
+	if !r.SelectAll {
+		t.Error("SelectAll = false, want true (star in FROM subquery)")
+	}
+}
+
 func TestStatementClass_String(t *testing.T) {
 	tests := []struct {
 		c    StatementClass

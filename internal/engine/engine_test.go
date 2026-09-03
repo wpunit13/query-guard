@@ -52,6 +52,28 @@ const ioPlanReal = `{
         "outputSizeInBytes": 524288.0
       }
     }
+  ],
+  "estimate": {
+    "cpuCost": 800.0
+  }
+}`
+
+// ioPlanNoCPU is an I/O plan with no root estimate (CPU absent).
+const ioPlanNoCPU = `{
+  "inputTableColumnInfos": [
+    {
+      "table": {
+        "catalog": "hive",
+        "schemaTable": {
+          "schema": "default",
+          "table": "orders"
+        }
+      },
+      "estimate": {
+        "outputRowCount": 10000.0,
+        "outputSizeInBytes": 1048576.0
+      }
+    }
   ]
 }`
 
@@ -97,7 +119,7 @@ func testPolicy() *config.Policy {
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestParseTrinoIOPlan_Real(t *testing.T) {
-	scanBytes, rows, scans, err := parseTrinoIOPlan([]byte(ioPlanReal))
+	scanBytes, rows, scans, cpuCost, err := parseTrinoIOPlan([]byte(ioPlanReal))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -110,10 +132,13 @@ func TestParseTrinoIOPlan_Real(t *testing.T) {
 	if len(scans) != 2 {
 		t.Fatalf("len(scans) = %d, want 2: %v", len(scans), scans)
 	}
+	if cpuCost != 800.0 {
+		t.Errorf("cpuCost = %v, want 800 (root estimate)", cpuCost)
+	}
 }
 
 func TestParseTrinoIOPlan_DetailsFallback(t *testing.T) {
-	scanBytes, rows, scans, err := parseTrinoIOPlan([]byte(ioPlanDetails))
+	scanBytes, rows, scans, cpuCost, err := parseTrinoIOPlan([]byte(ioPlanDetails))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -126,11 +151,104 @@ func TestParseTrinoIOPlan_DetailsFallback(t *testing.T) {
 	if len(scans) != 1 || scans[0].Table != "hive.default.orders" {
 		t.Errorf("unexpected scans: %v", scans)
 	}
+	if cpuCost != 0 {
+		t.Errorf("cpuCost = %v, want 0 (fallback path has no CPU estimate)", cpuCost)
+	}
 }
 
 func TestParseTrinoIOPlan_InvalidJSON(t *testing.T) {
-	if _, _, _, err := parseTrinoIOPlan([]byte("not json")); err == nil {
+	if _, _, _, _, err := parseTrinoIOPlan([]byte("not json")); err == nil {
 		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestParseTrinoIOPlan_CPUCost(t *testing.T) {
+	_, _, _, cpuCost, err := parseTrinoIOPlan([]byte(ioPlanReal))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cpuCost != 800.0 {
+		t.Errorf("cpuCost = %v, want 800 (root estimate)", cpuCost)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Feature A — CPU cost cap tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestEvaluate_CPUAllowed(t *testing.T) {
+	mock := &trinoMock{planJSON: ioPlanReal} // cpuCost 800
+	srv := httptest.NewServer(mock.handler())
+	defer srv.Close()
+
+	p := testPolicy()
+	p.Upstream.URL = srv.URL
+	p.Rules.CostLimits = []config.CostLimit{{MaxCPUCostPerQuery: 1000.0}}
+	e := NewTrinoEvaluator(config.NewConfig(p), nil)
+
+	res, err := e.Evaluate(context.Background(), "SELECT * FROM orders", http.Header{})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !res.Allowed {
+		t.Fatalf("expected allowed, reason=%q", res.Reason)
+	}
+	if res.EstimatedCPUCost != 800.0 {
+		t.Errorf("EstimatedCPUCost = %v, want 800", res.EstimatedCPUCost)
+	}
+}
+
+func TestEvaluate_CPUBlocked(t *testing.T) {
+	mock := &trinoMock{planJSON: ioPlanReal} // cpuCost 800
+	srv := httptest.NewServer(mock.handler())
+	defer srv.Close()
+
+	p := testPolicy()
+	p.Upstream.URL = srv.URL
+	p.Rules.CostLimits = []config.CostLimit{{MaxCPUCostPerQuery: 500.0}}
+	e := NewTrinoEvaluator(config.NewConfig(p), nil)
+
+	res, err := e.Evaluate(context.Background(), "SELECT * FROM orders", http.Header{})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if res.Allowed {
+		t.Fatal("expected blocked, got allowed")
+	}
+	if !strings.Contains(res.Reason, "cpu cost") {
+		t.Errorf("reason = %q, want it to mention cpu cost", res.Reason)
+	}
+}
+
+func TestEvaluate_CPUDisabledWhenZero(t *testing.T) {
+	mock := &trinoMock{planJSON: ioPlanReal} // cpuCost 800
+	srv := httptest.NewServer(mock.handler())
+	defer srv.Close()
+
+	p := testPolicy()
+	p.Upstream.URL = srv.URL
+	p.Rules.CostLimits = []config.CostLimit{{MaxCPUCostPerQuery: 0}} // disabled
+	e := NewTrinoEvaluator(config.NewConfig(p), nil)
+
+	res, err := e.Evaluate(context.Background(), "SELECT * FROM orders", http.Header{})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !res.Allowed {
+		t.Fatalf("expected allowed with CPU limit disabled, reason=%q", res.Reason)
+	}
+}
+
+func TestEvaluateLimits_CPUMissingWarns(t *testing.T) {
+	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
+	p := testPolicy()
+	p.Rules.CostLimits = []config.CostLimit{{MaxCPUCostPerQuery: 100.0}}
+	e.cfg.Set(p)
+
+	// Plan with no CPU estimate: must fail-open (allow) — never block on 0.
+	allowed, reason := e.evaluateLimits(context.Background(), 1_000, 10, nil, 0)
+	if !allowed {
+		t.Fatalf("expected fail-open allow when CPU estimate absent, reason=%q", reason)
 	}
 }
 
@@ -146,7 +264,7 @@ func TestEvaluateLimits_NoTableEstimates_RecordsMetric(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
 	e.SetMetrics(metrics)
 
-	allowed, _ := e.evaluateLimits(context.Background(), 1_000_000, 1000, nil)
+	allowed, _ := e.evaluateLimits(context.Background(), 1_000_000, 1000, nil, 0)
 	if !allowed {
 		t.Fatalf("expected fail-open allow, got blocked")
 	}
@@ -157,7 +275,7 @@ func TestEvaluateLimits_NoTableEstimates_RecordsMetric(t *testing.T) {
 	// With per-table scans present, the counter must NOT move.
 	allowed, _ = e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
 		{Table: "hive.default.orders", ScanBytes: 500_000, Rows: 1000},
-	})
+	}, 0)
 	if !allowed {
 		t.Fatalf("expected allowed, got blocked")
 	}
@@ -170,7 +288,7 @@ func TestEvaluateLimits_Allowed(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
 	allowed, reason := e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
 		{Table: "hive.default.orders", ScanBytes: 500_000, Rows: 1000},
-	})
+	}, 0)
 	if !allowed {
 		t.Fatalf("expected allowed, reason=%q", reason)
 	}
@@ -178,7 +296,7 @@ func TestEvaluateLimits_Allowed(t *testing.T) {
 
 func TestEvaluateLimits_PerQueryLimitBreach(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
-	allowed, reason := e.evaluateLimits(context.Background(), 20_000_000, 1000, nil)
+	allowed, reason := e.evaluateLimits(context.Background(), 20_000_000, 1000, nil, 0)
 	if allowed {
 		t.Fatalf("expected blocked, got allowed")
 	}
@@ -191,7 +309,7 @@ func TestEvaluateLimits_TableLimitBreach(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
 	allowed, reason := e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
 		{Table: "hive.default.orders", ScanBytes: 5_000_000, Rows: 1000},
-	})
+	}, 0)
 	if allowed {
 		t.Fatalf("expected blocked, got allowed")
 	}

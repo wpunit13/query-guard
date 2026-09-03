@@ -18,12 +18,12 @@ rules:
   table_blocklist:
     - lineitem        # bare name matches tpch.tiny.lineitem / any schema
 
-  # Tier 1b: these tables require a WHERE on the listed column.
+  # Tier 1b: these tables require a WHERE on the listed columns.
   required_filters:
     - catalog: tpch
       schema: tiny
       table: orders
-      column: orderdate
+      columns: [orderdate]
 
   # Tier 2: pre-flight cost limits.
   cost_limits:
