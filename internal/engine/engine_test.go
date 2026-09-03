@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"query-guard/internal/config"
+	"query-guard/internal/telemetry"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -135,9 +138,37 @@ func TestParseTrinoIOPlan_InvalidJSON(t *testing.T) {
 // evaluateLimits / tableMatches tests
 // ──────────────────────────────────────────────────────────────────────────────
 
+// TestEvaluateLimits_NoTableEstimates_RecordsMetric covers B5: when
+// table-scoped cost limits are configured but the plan yields no per-table
+// estimates, the inert-limit counter must increment (alertable signal).
+func TestEvaluateLimits_NoTableEstimates_RecordsMetric(t *testing.T) {
+	metrics := telemetry.NewMetrics(nil)
+	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
+	e.SetMetrics(metrics)
+
+	allowed, _ := e.evaluateLimits(context.Background(), 1_000_000, 1000, nil)
+	if !allowed {
+		t.Fatalf("expected fail-open allow, got blocked")
+	}
+	if got := testutil.ToFloat64(metrics.PreflightNoTableEstimates()); got != 1 {
+		t.Errorf("preflight_no_table_estimates_total = %v, want 1", got)
+	}
+
+	// With per-table scans present, the counter must NOT move.
+	allowed, _ = e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
+		{Table: "hive.default.orders", ScanBytes: 500_000, Rows: 1000},
+	})
+	if !allowed {
+		t.Fatalf("expected allowed, got blocked")
+	}
+	if got := testutil.ToFloat64(metrics.PreflightNoTableEstimates()); got != 1 {
+		t.Errorf("preflight_no_table_estimates_total = %v, want still 1", got)
+	}
+}
+
 func TestEvaluateLimits_Allowed(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
-	allowed, reason := e.evaluateLimits(1_000_000, 1000, []TableScan{
+	allowed, reason := e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
 		{Table: "hive.default.orders", ScanBytes: 500_000, Rows: 1000},
 	})
 	if !allowed {
@@ -147,7 +178,7 @@ func TestEvaluateLimits_Allowed(t *testing.T) {
 
 func TestEvaluateLimits_PerQueryLimitBreach(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
-	allowed, reason := e.evaluateLimits(20_000_000, 1000, nil)
+	allowed, reason := e.evaluateLimits(context.Background(), 20_000_000, 1000, nil)
 	if allowed {
 		t.Fatalf("expected blocked, got allowed")
 	}
@@ -158,7 +189,7 @@ func TestEvaluateLimits_PerQueryLimitBreach(t *testing.T) {
 
 func TestEvaluateLimits_TableLimitBreach(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
-	allowed, reason := e.evaluateLimits(1_000_000, 1000, []TableScan{
+	allowed, reason := e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
 		{Table: "hive.default.orders", ScanBytes: 5_000_000, Rows: 1000},
 	})
 	if allowed {

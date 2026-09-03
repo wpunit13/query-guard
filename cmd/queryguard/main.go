@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,11 +23,12 @@ func main() {
 	flag.IntVar(&port, "port", 0, "override server.port from the policy (0 = use policy value)")
 	flag.Parse()
 
-	logger := log.New(os.Stdout, "[query-guard] ", log.LstdFlags|log.Lmsgprefix)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
 	p, err := config.Load(policyPath)
 	if err != nil {
-		logger.Fatalf("failed to load config %q: %v", policyPath, err)
+		logger.Error("failed to load config", slog.String("path", policyPath), slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 	if port != 0 {
 		p.Server.Port = port
@@ -41,11 +42,13 @@ func main() {
 	// Pre-flight cost evaluator (Trino, fail-open on errors). It reads the
 	// upstream and timeout from cfg on every evaluation, so those hot-reload.
 	evaluator := engine.NewTrinoEvaluator(cfg, nil)
+	evaluator.SetMetrics(metrics)
 
 	// Core proxy handler.
 	handler, err := proxy.NewHandler(cfg, evaluator, logger)
 	if err != nil {
-		logger.Fatalf("failed to build handler: %v", err)
+		logger.Error("failed to build handler", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 	handler.SetMetrics(metrics)
 
@@ -54,21 +57,22 @@ func main() {
 	watcher := config.NewWatcher(cfg, policyPath)
 	currentUpstream := cfg.Get().Upstream.URL
 	watcher.OnReload(func(np *config.Policy) {
-		logger.Printf("policy reloaded: %d blocklist entries, %d cost limits",
-			len(np.Rules.TableBlocklist), len(np.Rules.CostLimits))
+		logger.Info("policy reloaded",
+			slog.Int("blocklist_entries", len(np.Rules.TableBlocklist)),
+			slog.Int("cost_limits", len(np.Rules.CostLimits)))
 		// Rebuild the reverse proxy if the upstream changed.
 		if np.Upstream.URL != currentUpstream {
 			if err := handler.UpdateUpstream(np.Upstream.URL); err != nil {
-				logger.Printf("failed to update upstream to %q: %v", np.Upstream.URL, err)
+				logger.Error("failed to update upstream", slog.String("upstream", np.Upstream.URL), slog.String("error", err.Error()))
 			} else {
-				logger.Printf("upstream updated to %q (hot-reload)", np.Upstream.URL)
+				logger.Info("upstream updated (hot-reload)", slog.String("upstream", np.Upstream.URL))
 				currentUpstream = np.Upstream.URL
 			}
 		}
 	})
 	go func() {
 		if err := watcher.Start(watchCtx); err != nil {
-			logger.Printf("config watcher stopped: %v", err)
+			logger.Warn("config watcher stopped", slog.String("error", err.Error()))
 		}
 	}()
 
@@ -88,28 +92,30 @@ func main() {
 		if p.Server.TLS.Enabled() {
 			// HTTPS-only: no plaintext listener exists, so Authorization and
 			// X-Trino-* headers are never transmitted unencrypted.
-			logger.Printf("query-guard listening on https://%s (TLS enabled), proxying to %s", addr, p.Upstream.URL)
+			logger.Info("query-guard listening", "scheme", "https", "addr", addr, "upstream", p.Upstream.URL)
 			if err := srv.ListenAndServeTLS(p.Server.TLS.CertFile, p.Server.TLS.KeyFile); err != nil && err != http.ErrServerClosed {
-				logger.Fatalf("https server error: %v", err)
+				logger.Error("https server error", slog.String("error", err.Error()))
+				os.Exit(1)
 			}
 		} else {
-			logger.Printf("query-guard listening on http://%s (TLS disabled), proxying to %s", addr, p.Upstream.URL)
+			logger.Info("query-guard listening", "scheme", "http", "addr", addr, "upstream", p.Upstream.URL)
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				logger.Fatalf("http server error: %v", err)
+				logger.Error("http server error", slog.String("error", err.Error()))
+				os.Exit(1)
 			}
 		}
 	}()
 
 	sig := <-sigCh
-	logger.Printf("received signal %s, shutting down", sig)
+	logger.Info("received signal, shutting down", "signal", sig.String())
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), p.Server.ShutdownGrace)
 	defer cancelShutdown()
 	cancelWatcher()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Printf("shutdown error: %v", err)
+		logger.Warn("shutdown error", slog.String("error", err.Error()))
 	}
-	logger.Printf("shutdown complete")
+	logger.Info("shutdown complete")
 }
 
 // hstsHandler wraps the root handler with a Strict-Transport-Security header

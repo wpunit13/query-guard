@@ -153,6 +153,19 @@ Guarded connection summary:
 - `GET /readyz` — readiness probe. `200` when the upstream is reachable,
   `503` otherwise. Used by the Helm chart.
 
+## Logging & request correlation
+
+Logs are structured (`log/slog` key-value text). Every statement request is
+assigned a **request ID** — taken from an inbound `X-Request-ID` header if
+present, otherwise minted — that appears in:
+
+- all guard log lines for that request (tier 1/tier 2 decisions, fail-open
+  events, pre-flight errors from the engine),
+- the JSON rejection body (`"request_id": "…"`) returned to the client.
+
+Operators: ask users for the `request_id` from a rejected response to grep
+the guard's logs; send `X-Request-ID` from your own tooling to pre-correlate.
+
 ## Deployment (Kubernetes/Helm)
 
 Build the image and lint the Helm chart:
@@ -236,6 +249,26 @@ the chart — manage it with cert-manager or your own process. Certificate
 rotation is restart-based: update the Secret and restart the pods
 (`kubectl rollout restart`); the distroless image has no reload signal.
 
+## Performance
+
+Measured with the in-repo load harness (`internal/integration/load_test.go`;
+run `go test ./internal/integration/ -run TestLoad -v`). The coordinator is a
+fake with a 10ms-per-hop pre-flight delay — these numbers measure the **proxy
+overhead**, not real Trino EXPLAIN cost (which dominates in production and
+depends entirely on your cluster).
+
+- **Pre-flight (Tier 2) latency cost** — 200 statement submissions, 16
+  concurrent clients, `preflight.max_concurrent: 5`:
+  - Tier 2 OFF: P50 ≈ 2.4ms, P95 ≈ 12ms
+  - Tier 2 ON (3 protocol hops × 10ms + gate queueing): P50 ≈ 38ms, P95 ≈ 50ms
+  - The added latency scales with your coordinator's EXPLAIN round-trip and
+    is capped by `preflight.max_concurrent` queueing. Statement bodies are
+    never buffered beyond the 8 MiB inspection cap.
+- **Streaming memory (flat)** — 4 × 32 MiB JSON pages through the
+  Trino-URL rewrite path allocated **≈ 1 MiB** of proxy memory total
+  (bounded-prefix rewrite + streamed remainder). Pages are never fully
+  buffered.
+
 ## Security
 
 **Token handling.** query-guard is a transparent passthrough: `Authorization`
@@ -266,4 +299,5 @@ bypasses the guard. This is a recorded scope decision — see `NEXT_TASKS.md`
 
 ## Status
 
-See `progress.md` for the phase tracker.
+See `progress.md` for the phase tracker and `RUNBOOK.md` for operational
+guidance (metrics, alerts, incident procedures).

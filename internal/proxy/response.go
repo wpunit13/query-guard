@@ -28,10 +28,14 @@ type rejectionResponse struct {
 	ErrorCode string          `json:"error_code"`
 	Reason    RejectionReason `json:"reason"`
 	Message   string          `json:"message"`
+	// RequestID correlates the rejection with the guard's log lines (and
+	// echoes an inbound X-Request-ID when the client supplied one).
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // WriteRejection renders a standard JSON 4xx response for a rejected query.
-func WriteRejection(w http.ResponseWriter, status int, reason RejectionReason, message string) {
+// requestID may be empty (omitted from the body).
+func WriteRejection(w http.ResponseWriter, status int, reason RejectionReason, message, requestID string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	// Encoding errors are not actionable here; the status line is already sent.
@@ -39,5 +43,6 @@ func WriteRejection(w http.ResponseWriter, status int, reason RejectionReason, m
 		ErrorCode: errorCodeLimitBreach,
 		Reason:    reason,
 		Message:   message,
+		RequestID: requestID,
 	})
 }

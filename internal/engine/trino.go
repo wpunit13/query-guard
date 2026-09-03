@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"query-guard/internal/config"
+	"query-guard/internal/ctxlog"
+	"query-guard/internal/telemetry"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -44,7 +46,8 @@ type TrinoEvaluator struct {
 	client      *http.Client
 	timeout     time.Duration
 	sem         chan struct{}
-	logger      *log.Logger
+	logger      *slog.Logger
+	metrics     *telemetry.Metrics
 }
 
 // NewTrinoEvaluator builds a TrinoEvaluator from the shared, hot-reloadable
@@ -77,13 +80,19 @@ func NewTrinoEvaluator(cfg *config.Config, client *http.Client) *TrinoEvaluator 
 		client:      client,
 		timeout:     timeout,
 		sem:         make(chan struct{}, maxConcurrent),
-		logger:      log.New(os.Stderr, "[engine/trino] ", log.LstdFlags),
+		logger:      slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	}
 }
 
 // Engine returns the engine name for telemetry labels.
 func (e *TrinoEvaluator) Engine() string {
 	return trinoEngineName
+}
+
+// SetMetrics attaches a telemetry sink. Passing nil leaves telemetry
+// disabled. All recording methods are nil-safe.
+func (e *TrinoEvaluator) SetMetrics(m *telemetry.Metrics) {
+	e.metrics = m
 }
 
 // currentUpstream returns the up-to-date upstream base URL from the live
@@ -145,7 +154,7 @@ func (e *TrinoEvaluator) Evaluate(ctx context.Context, query string, headers htt
 	result.EstimatedRows = rows
 	result.TableScans = scans
 
-	result.Allowed, result.Reason = e.evaluateLimits(scanBytes, rows, scans)
+	result.Allowed, result.Reason = e.evaluateLimits(ctx, scanBytes, rows, scans)
 	return result, nil
 }
 
@@ -243,7 +252,7 @@ func (e *TrinoEvaluator) runStatement(ctx context.Context, startURI, method, bod
 
 // evaluateLimits checks estimated usage against the configured cost limits.
 // It returns (allowed, reason). A non-empty reason explains a rejection.
-func (e *TrinoEvaluator) evaluateLimits(totalScanBytes, totalRows int64, scans []TableScan) (bool, string) {
+func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, totalRows int64, scans []TableScan) (bool, string) {
 	p := e.cfg.Get()
 
 	// Detect table-scoped limits that cannot be enforced because the plan
@@ -256,7 +265,9 @@ func (e *TrinoEvaluator) evaluateLimits(totalScanBytes, totalRows int64, scans [
 		}
 	}
 	if hasTableLimits && len(scans) == 0 {
-		e.logger.Printf("warning: table-scoped cost limits configured but no per-table scan estimates were produced; table limits are not enforced")
+		e.metrics.RecordPreflightNoTableEstimates()
+		e.logger.Warn("table-scoped cost limits configured but no per-table scan estimates were produced; table limits are not enforced",
+			slog.String("request_id", ctxlog.FromContext(ctx)))
 	}
 
 	for _, lim := range p.Rules.CostLimits {

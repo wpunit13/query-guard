@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -92,7 +92,7 @@ func newTestHandler(t *testing.T, policy *config.Policy, eval engine.CostEvaluat
 	u := newUpstreamRecorder(t, http.StatusOK)
 	policy.Upstream.URL = u.server.URL
 
-	h, err := NewHandler(config.NewConfig(policy), eval, log.New(io.Discard, "", 0))
+	h, err := NewHandler(config.NewConfig(policy), eval, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestUpdateUpstream_HotReload(t *testing.T) {
 	p := testPolicy()
 	p.Upstream.URL = u1.server.URL
 
-	h, err := NewHandler(config.NewConfig(p), nil, log.New(io.Discard, "", 0))
+	h, err := NewHandler(config.NewConfig(p), nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestNoCredentialLogging(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var logBuf strings.Builder
-			logger := log.New(&logBuf, "", 0)
+			logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 			h, _ := newTestHandler(t, testPolicy(), tc.eval)
 			h.logger = logger
 
@@ -260,6 +260,61 @@ func TestNoCredentialLogging(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRequestIDCorrelation verifies B1: every statement request gets a
+// request ID that (a) appears in the guard's log lines for that request,
+// (b) appears in the JSON rejection body, and (c) honors an inbound
+// X-Request-ID instead of minting a new one.
+func TestRequestIDCorrelation(t *testing.T) {
+	// Blocked request with a client-supplied ID.
+	p := testPolicy()
+	p.Rules.TableBlocklist = []string{"blocked_tbl"}
+	var logBuf strings.Builder
+	h, _ := newTestHandler(t, p, nil)
+	h.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	const clientID = "my-correlation-id-123"
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM blocked_tbl", map[string]string{
+		"X-Request-ID": clientID,
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+
+	// (a) The ID appears in the tier-1 rejection log line.
+	if !strings.Contains(logBuf.String(), "request_id="+clientID) {
+		t.Errorf("client request ID missing from logs:\n%s", logBuf.String())
+	}
+
+	// (b) The ID appears in the rejection body.
+	assertRejection(t, rec, ReasonTableBlocklist)
+	var body struct {
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("rejection body is not valid JSON: %v", rec.Body.String())
+	}
+	if body.RequestID != clientID {
+		t.Errorf("rejection body request_id = %q, want echoed client ID %q", body.RequestID, clientID)
+	}
+
+	// (c) Without an inbound header, a fresh ID is minted (16 hex chars) and
+	// still lands in both the logs and the body.
+	var logBuf2 strings.Builder
+	h2, _ := newTestHandler(t, p, nil)
+	h2.logger = slog.New(slog.NewTextHandler(&logBuf2, nil))
+	rec2 := doRequest(h2, http.MethodPost, statementPath, "SELECT * FROM blocked_tbl", nil)
+	var body2 struct {
+		RequestID string `json:"request_id"`
+	}
+	_ = json.Unmarshal(rec2.Body.Bytes(), &body2)
+	if body2.RequestID == "" || len(body2.RequestID) != 16 {
+		t.Errorf("minted request_id = %q, want 16 hex chars", body2.RequestID)
+	}
+	if !strings.Contains(logBuf2.String(), "request_id="+body2.RequestID) {
+		t.Errorf("minted request ID missing from logs:\n%s", logBuf2.String())
 	}
 }
 
@@ -357,7 +412,7 @@ func TestOversizedBody_FailsOpen(t *testing.T) {
 func TestReadyz_UpstreamDown(t *testing.T) {
 	p := testPolicy()
 	p.Upstream.URL = "http://127.0.0.1:1" // nothing listening
-	h, err := NewHandler(config.NewConfig(p), nil, log.New(io.Discard, "", 0))
+	h, err := NewHandler(config.NewConfig(p), nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}

@@ -40,3 +40,4 @@ dist/
 # Markdown docs — keep only README.md tracked
 *.md
 !README.md
+!RUNBOOK.md

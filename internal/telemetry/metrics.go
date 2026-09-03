@@ -39,11 +39,12 @@ const defaultEngine = "trino"
 type Metrics struct {
 	registry *prometheus.Registry
 
-	queriesTotal      *prometheus.CounterVec
-	blockedBytesTotal prometheus.Counter
-	preflightDuration prometheus.Histogram
-	preflightRejected prometheus.Counter
-	parserErrorsTotal prometheus.Counter
+	queriesTotal              *prometheus.CounterVec
+	blockedBytesTotal         prometheus.Counter
+	preflightDuration         prometheus.Histogram
+	preflightRejected         prometheus.Counter
+	preflightNoTableEstimates prometheus.Counter
+	parserErrorsTotal         prometheus.Counter
 }
 
 // NewMetrics builds a Metrics bound to the given registry. If registry is nil,
@@ -86,12 +87,19 @@ func NewMetrics(registry *prometheus.Registry) *Metrics {
 		Help:      "Total number of pre-flight evaluations rejected because the concurrency gate was saturated (fail-open).",
 	})
 
+	m.preflightNoTableEstimates = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "queryguard",
+		Name:      "preflight_no_table_estimates_total",
+		Help:      "Total number of pre-flight evaluations where table-scoped cost limits were configured but the plan produced no per-table estimates (those limits were not enforced).",
+	})
+
 	registry.MustRegister(
 		m.queriesTotal,
 		m.blockedBytesTotal,
 		m.preflightDuration,
 		m.preflightRejected,
 		m.parserErrorsTotal,
+		m.preflightNoTableEstimates,
 	)
 
 	return m
@@ -139,6 +147,22 @@ func (m *Metrics) RecordPreflightRejected() {
 		return
 	}
 	m.preflightRejected.Inc()
+}
+
+// RecordPreflightNoTableEstimates increments the counter for pre-flight
+// evaluations where table-scoped cost limits could not be enforced because
+// the plan yielded no per-table estimates (the guard is partially inert).
+func (m *Metrics) RecordPreflightNoTableEstimates() {
+	if m == nil {
+		return
+	}
+	m.preflightNoTableEstimates.Inc()
+}
+
+// PreflightNoTableEstimates exposes the counter for tests and custom
+// registry wiring.
+func (m *Metrics) PreflightNoTableEstimates() prometheus.Counter {
+	return m.preflightNoTableEstimates
 }
 
 // Handler returns an http.Handler that serves Prometheus metrics in the
