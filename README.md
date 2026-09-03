@@ -40,6 +40,10 @@ This runs both Trino (`trinodb/trino:476`) and query-guard as containers on a
 shared network. Query-guard references Trino by the compose service name, so no
 host networking is needed.
 
+To change the guard policy for the Dockerized stack, edit
+`deploy/compose/policy.yaml` — it is bind-mounted into the container and
+hot-reloads (no restart needed for rule/upstream changes).
+
 | Component | Address |
 |-----------|---------|
 | Trino (container) | `http://localhost:8082` |
