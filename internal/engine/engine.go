@@ -58,6 +58,11 @@ type CostResult struct {
 	// EstimatedRows is the total estimated rows scanned across all tables.
 	EstimatedRows int64
 
+	// EstimatedCPUCost is the query-total estimated CPU cost from the plan's
+	// root estimate (Trino's `estimate.cpuCost`). 0 when the plan carries no
+	// CPU estimate. Global only — CPU is not attributable per-table.
+	EstimatedCPUCost float64
+
 	// TableScans holds per-table estimates for table-scoped limit matching.
 	TableScans []TableScan
 

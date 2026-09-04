@@ -115,6 +115,141 @@ func TestDefaults_Applied(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// v1 Guard-Enhancement Config Tests (audit, function/star blocklists, CPU
+// cost cap, required-filter schema)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestV1Config_NewFieldsParse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	writeFile(t, path, `
+server:
+  port: 8080
+
+upstream:
+  url: "http://trino:8080"
+
+audit:
+  log_rejections: true
+  snapshot_plan: true
+
+rules:
+  function_blocklist: [regexp_count, regexp_extract]
+  select_star_blocked_tables: [wide_table, events]
+  required_filters:
+    - catalog: finance
+      schema: reporting
+      table: daily_orders
+      mode: any-of
+      columns: [ds, month, year]
+  cost_limits:
+    - max_cpu_cost_per_query: 500.0
+`)
+
+	p, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if !p.Audit.LogRejections || !p.Audit.SnapshotPlan {
+		t.Errorf("audit config not parsed: %+v", p.Audit)
+	}
+	if len(p.Rules.FunctionBlocklist) != 2 || len(p.Rules.SelectStarBlockedTables) != 2 {
+		t.Errorf("blocklists not parsed: %+v", p.Rules)
+	}
+	rf := p.Rules.RequiredFilters[0]
+	if rf.Mode != "any-of" || len(rf.Columns) != 3 {
+		t.Errorf("required filter not parsed: %+v", rf)
+	}
+	if p.Rules.CostLimits[0].MaxCPUCostPerQuery != 500.0 {
+		t.Errorf("cpu cost limit not parsed: %+v", p.Rules.CostLimits[0])
+	}
+}
+
+func TestV1Config_RequiredFilterValidation(t *testing.T) {
+	cases := map[string]string{
+		"missing schema": `
+rules:
+  required_filters:
+    - table: daily_orders
+      columns: [ds]
+`,
+		"missing table": `
+rules:
+  required_filters:
+    - schema: reporting
+      columns: [ds]
+`,
+		"empty columns": `
+rules:
+  required_filters:
+    - schema: reporting
+      table: daily_orders
+      columns: []
+`,
+		"invalid mode": `
+rules:
+  required_filters:
+    - schema: reporting
+      table: daily_orders
+      mode: some-of
+      columns: [ds]
+`,
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "policy.yaml")
+			writeFile(t, path, "upstream:\n  url: \"http://trino:8080\"\n"+yaml)
+
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("expected validation error for %s, got nil", name)
+			}
+		})
+	}
+}
+
+func TestV1Config_NegativeCPUCostRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	writeFile(t, path, `
+upstream:
+  url: "http://trino:8080"
+
+rules:
+  cost_limits:
+    - max_cpu_cost_per_query: -1.0
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for negative max_cpu_cost_per_query, got nil")
+	}
+}
+
+func TestV1Config_UnknownFieldRejected(t *testing.T) {
+	// Strict decode: the removed singular `column` field of required_filters
+	// must fail loudly rather than silently no-op (breaking schema change).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	writeFile(t, path, `
+upstream:
+  url: "http://trino:8080"
+
+rules:
+  required_filters:
+    - schema: reporting
+      table: daily_orders
+      column: ds
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for removed `column` field, got nil")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // TLS Config Tests
 // ──────────────────────────────────────────────────────────────────────────────
 

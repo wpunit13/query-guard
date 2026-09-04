@@ -256,6 +256,7 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 	if reason, msg, allow := h.tier1(res); !allow {
 		log.Info("query rejected by tier 1",
 			slog.String("stage", string(reason)), slog.String("statement_class", res.StatementClass.String()))
+		h.auditRejection(r, query, reason, res, nil)
 		h.record(telemetry.StatusBlocked)
 		h.reject(r, w, reason, msg)
 		return
@@ -263,7 +264,7 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 
 	// Tier 2: pre-flight cost evaluation for read queries with cost limits.
 	if h.shouldPreflight(res.StatementClass) {
-		allowed, reason, err := h.tier2(r.Context(), r.Header, query)
+		allowed, reason, cost, err := h.tier2(r.Context(), r.Header, query)
 		if err != nil {
 			// Fail-open: evaluation could not complete; forward the query.
 		} else if !allowed {
@@ -271,6 +272,7 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 			// to the telemetry counter inside tier2.)
 			log.Info("query rejected by tier 2",
 				slog.String("stage", string(reason)))
+			h.auditRejection(r, query, ReasonCostLimitBreach, res, &cost)
 			h.record(telemetry.StatusBlocked)
 			h.reject(r, w, ReasonCostLimitBreach, reason)
 			return
@@ -307,20 +309,95 @@ func (h *Handler) tier1(res *parser.AnalysisResult) (RejectionReason, string, bo
 		}
 	}
 
-	// Required filters: any table with a configured filter must reference the
-	// required column in its WHERE/ON clause, on that specific table.
+	// Function blocklist (Feature B): any blocked function appearing in the
+	// projections or WHERE/ON clauses (including CTEs/subqueries) is rejected.
+	for _, fn := range res.Functions {
+		for _, blocked := range p.Rules.FunctionBlocklist {
+			if strings.EqualFold(fn, blocked) {
+				return ReasonFunctionBlocklist, fmt.Sprintf("function %q is blocked by policy", fn), false
+			}
+		}
+	}
+
+	// SELECT * restriction (Feature C): projection-level stars over listed
+	// tables are rejected; explicit column lists are fine. COUNT(*) is not a
+	// projection star and is never flagged.
+	if res.SelectAll {
+		for _, bad := range p.Rules.SelectStarBlockedTables {
+			for _, table := range res.Tables {
+				if tableBlocklisted(table, bad) {
+					return ReasonSelectStarBlocked, fmt.Sprintf("SELECT * on table %q is blocked (specify explicit columns)", table), false
+				}
+			}
+		}
+	}
+
+	// Required filters (Feature E): entries match exactly one schema.table
+	// (plus catalog when set) — no suffix/bare-name breadth. Column filtering
+	// must be attributed to that specific table; mode is any-of or all-of.
 	for _, rf := range p.Rules.RequiredFilters {
 		for _, table := range res.Tables {
-			if !tableMatchesScope(table, rf.Catalog, rf.Schema, rf.Table) {
+			if !requiredFilterMatches(table, rf) {
 				continue
 			}
-			if !tableHasFilter(res, table, rf.Column) {
-				return ReasonRequiredFilter, fmt.Sprintf("query on table %q must filter on column %q (required filter)", table, rf.Column), false
+			missing := missingRequiredColumns(res, table, rf)
+			if len(missing) > 0 {
+				return ReasonRequiredFilter, fmt.Sprintf("query on table %q must filter on column(s) %s (required filter, mode %s)",
+					table, strings.Join(missing, ", "), requiredFilterMode(rf)), false
 			}
 		}
 	}
 
 	return ReasonTableBlocklist, "", true
+}
+
+// requiredFilterMatches reports whether a referenced table matches a required
+// filter entry. Unlike tableMatchesScope, matching is strict: schema.table
+// must both be present in the reference (catalog too, when set) — no
+// suffix/bare-table breadth. Case-insensitive (Trino unquoted identifiers).
+func requiredFilterMatches(table string, rf config.RequiredFilter) bool {
+	parts := strings.Split(table, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	if !strings.EqualFold(parts[len(parts)-1], rf.Table) {
+		return false
+	}
+	if !strings.EqualFold(parts[len(parts)-2], rf.Schema) {
+		return false
+	}
+	if rf.Catalog != "" {
+		if len(parts) < 3 || !strings.EqualFold(parts[len(parts)-3], rf.Catalog) {
+			return false
+		}
+	}
+	return true
+}
+
+// requiredFilterMode returns the effective mode of an entry ("any-of" or
+// "all-of"); an empty configured mode defaults to all-of.
+func requiredFilterMode(rf config.RequiredFilter) string {
+	if rf.Mode == "any-of" {
+		return "any-of"
+	}
+	return "all-of"
+}
+
+// missingRequiredColumns returns the required columns that are NOT filtered
+// on for the given table. For all-of mode (the default) that is every absent
+// column; for any-of mode it is all columns when none are present (the query
+// is then rejected), or empty when at least one is present (allowed).
+func missingRequiredColumns(res *parser.AnalysisResult, table string, rf config.RequiredFilter) []string {
+	var missing []string
+	for _, col := range rf.Columns {
+		if !tableHasFilter(res, table, col) {
+			missing = append(missing, col)
+		}
+	}
+	if requiredFilterMode(rf) == "any-of" && len(missing) < len(rf.Columns) {
+		return nil // at least one required column is filtered → satisfied
+	}
+	return missing
 }
 
 // tableBlocklisted reports whether a table name matches a blocklist entry.
@@ -403,14 +480,17 @@ func (h *Handler) shouldPreflight(class parser.StatementClass) bool {
 	return len(p.Rules.CostLimits) > 0 && h.evaluator != nil
 }
 
-// tier2 runs the pre-flight cost evaluation. It returns (allowed, reason, err).
-// The contract is explicit:
+// tier2 runs the pre-flight cost evaluation. It returns (allowed, reason,
+// cost, err). The contract is explicit:
 //   - err != nil  → evaluation could not complete → caller fails open (forward).
 //   - err == nil && !allowed → definitive limit breach → caller rejects.
 //   - err == nil && allowed  → within limits → caller forwards.
-func (h *Handler) tier2(ctx context.Context, headers http.Header, query string) (bool, string, error) {
+//
+// cost is populated whenever err == nil (including rejections) so the audit
+// snapshot can include the estimates that triggered the block.
+func (h *Handler) tier2(ctx context.Context, headers http.Header, query string) (bool, string, engine.CostResult, error) {
 	start := time.Now()
-	res, err := h.evaluator.Evaluate(ctx, query, headers)
+	cost, err := h.evaluator.Evaluate(ctx, query, headers)
 	h.observePreflight(time.Since(start))
 
 	if err != nil {
@@ -422,15 +502,15 @@ func (h *Handler) tier2(ctx context.Context, headers http.Header, query string) 
 		h.logger.Error("pre-flight evaluation error (fail-open)",
 			slog.String("request_id", ctxlog.FromContext(ctx)),
 			slog.String("error", err.Error()))
-		return false, "", err
+		return false, "", cost, err
 	}
 
-	if !res.Allowed {
+	if !cost.Allowed {
 		// Blocked: attribute the estimated bytes to the blocked-byte counter.
-		h.metricsBlockedBytes(res.EstimatedScanBytes)
-		return false, res.Reason, nil
+		h.metricsBlockedBytes(cost.EstimatedScanBytes)
+		return false, cost.Reason, cost, nil
 	}
-	return true, "", nil
+	return true, "", cost, nil
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -456,6 +536,53 @@ func (h *Handler) forwardFull(w http.ResponseWriter, r *http.Request, prefix []b
 // reject writes a standard JSON 400 rejection, correlated to the request ID.
 func (h *Handler) reject(r *http.Request, w http.ResponseWriter, reason RejectionReason, message string) {
 	WriteRejection(w, http.StatusBadRequest, reason, message, ctxlog.FromContext(r.Context()))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Audit logging (Feature D) — rejections only, strictly opt-in
+// ──────────────────────────────────────────────────────────────────────────────
+
+// auditRejection emits one structured audit line for a rejected query, only
+// when audit.log_rejections is enabled (read live from config, so hot-reloads
+// apply). Identity fields (X-Trino-User, X-Trino-Client-Tags) appear ONLY in
+// these opt-in audit records — never in other logs (see TestNoCredentialLogging).
+// Authorization values are never logged anywhere, audit lines included.
+// cost is non-nil only for Tier-2 rejections; the plan snapshot is included
+// only when audit.snapshot_plan is enabled.
+func (h *Handler) auditRejection(r *http.Request, query string, reason RejectionReason, res *parser.AnalysisResult, cost *engine.CostResult) {
+	p := h.cfg.Get()
+	if !p.Audit.LogRejections {
+		return
+	}
+
+	attrs := []slog.Attr{
+		slog.String("query", query),
+		slog.String("reason", string(reason)),
+		slog.Any("tables", res.Tables),
+		slog.Any("where_columns", res.WhereColumns),
+		slog.String("user", r.Header.Get("X-Trino-User")),
+		slog.String("client_tags", r.Header.Get("X-Trino-Client-Tags")),
+		slog.String("request_id", ctxlog.FromContext(r.Context())),
+	}
+
+	if p.Audit.SnapshotPlan && cost != nil {
+		scans := make([]map[string]any, 0, len(cost.TableScans))
+		for _, s := range cost.TableScans {
+			scans = append(scans, map[string]any{
+				"table":      s.Table,
+				"scan_bytes": s.ScanBytes,
+				"rows":       s.Rows,
+			})
+		}
+		attrs = append(attrs, slog.Any("snapshot", map[string]any{
+			"estimated_bytes": cost.EstimatedScanBytes,
+			"estimated_rows":  cost.EstimatedRows,
+			"estimated_cpu":   cost.EstimatedCPUCost,
+			"table_scans":     scans,
+		}))
+	}
+
+	h.logger.LogAttrs(r.Context(), slog.LevelInfo, "audit_rejection", attrs...)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 package parser
 
 import (
+	"strings"
+
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -33,6 +35,16 @@ type AnalysisResult struct {
 
 	// CTEAliases lists the alias names defined in WITH clauses.
 	CTEAliases []string
+
+	// Functions lists function/UDF names (lowercased) appearing in the
+	// SELECT projections or WHERE/ON clauses, including inside CTEs and
+	// subqueries. Used for function-blocklist enforcement.
+	Functions []string
+
+	// SelectAll is true when the statement projects `*` or `table.*` at the
+	// top level of a SELECT list. COUNT(*) and other aggregate arguments do
+	// NOT set this flag — only projection-level stars do.
+	SelectAll bool
 
 	// StatementClass is the classified verb category.
 	StatementClass StatementClass
@@ -167,6 +179,85 @@ func analyzeSelect(sel *sqlparser.Select, result *AnalysisResult) {
 	// 4. Walk FROM/JOIN for ON-clause column references only (not table names).
 	for _, tableExpr := range sel.From {
 		extractOnClauseColumns(tableExpr, result)
+	}
+
+	// 4b. Recurse into FROM derived tables (subqueries) so stars, functions,
+	// and column refs inside them are captured too.
+	for _, tableExpr := range sel.From {
+		if aliased, ok := tableExpr.(*sqlparser.AliasedTableExpr); ok {
+			if derived, ok := aliased.Expr.(*sqlparser.DerivedTable); ok {
+				if inner, ok := derived.Select.(*sqlparser.Select); ok {
+					analyzeSelect(inner, result)
+				}
+			}
+		}
+	}
+
+	// 5. Collect function calls and projection-level star expressions.
+	collectFunctionsAndStars(sel, result)
+}
+
+// collectFunctionsAndStars records function/UDF names (lowercased) from the
+// SELECT projections and WHERE clause, and flags projection-level star
+// expressions (`SELECT *`, `SELECT t.*`) in result.SelectAll.
+//
+// Star detection deliberately inspects ONLY top-level SelectExprs entries —
+// never FuncExpr arguments — because vitess parses COUNT(*) as a FuncExpr
+// whose argument is a StarExpr, and aggregates must not be flagged.
+// (Note: in vitess a StarExpr is a SelectExpr but not an Expr, so a star can
+// only appear as a top-level projection entry.)
+// This pass is separate from extractColumnsFromExpr (which only runs on
+// WHERE/ON) so projection-list functions are captured too.
+func collectFunctionsAndStars(sel *sqlparser.Select, result *AnalysisResult) {
+	for _, expr := range sel.SelectExprs {
+		if _, isStar := expr.(*sqlparser.StarExpr); isStar {
+			result.SelectAll = true
+			continue
+		}
+		if aliased, ok := expr.(*sqlparser.AliasedExpr); ok {
+			collectFunctionsFromExpr(aliased.Expr, result)
+		}
+	}
+	if sel.Where != nil {
+		collectFunctionsFromExpr(sel.Where.Expr, result)
+	}
+}
+
+// collectFunctionsFromExpr walks an expression tree recording function names
+// (lowercased) into result.Functions, recursing into arguments and nested
+// expressions. It does not touch column collection or star detection.
+func collectFunctionsFromExpr(expr sqlparser.Expr, result *AnalysisResult) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *sqlparser.FuncExpr:
+		result.Functions = append(result.Functions, strings.ToLower(e.Name.String()))
+		for _, arg := range e.Exprs {
+			collectFunctionsFromExpr(arg, result)
+		}
+	case *sqlparser.ComparisonExpr:
+		collectFunctionsFromExpr(e.Left, result)
+		collectFunctionsFromExpr(e.Right, result)
+	case *sqlparser.AndExpr:
+		collectFunctionsFromExpr(e.Left, result)
+		collectFunctionsFromExpr(e.Right, result)
+	case *sqlparser.OrExpr:
+		collectFunctionsFromExpr(e.Left, result)
+		collectFunctionsFromExpr(e.Right, result)
+	case *sqlparser.NotExpr:
+		collectFunctionsFromExpr(e.Expr, result)
+	case *sqlparser.IsExpr:
+		collectFunctionsFromExpr(e.Left, result)
+	case *sqlparser.BetweenExpr:
+		collectFunctionsFromExpr(e.Left, result)
+		collectFunctionsFromExpr(e.From, result)
+		collectFunctionsFromExpr(e.To, result)
+	case *sqlparser.BinaryExpr:
+		collectFunctionsFromExpr(e.Left, result)
+		collectFunctionsFromExpr(e.Right, result)
+	case *sqlparser.UnaryExpr:
+		collectFunctionsFromExpr(e.Expr, result)
 	}
 }
 

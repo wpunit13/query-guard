@@ -21,6 +21,8 @@ const (
 	ReasonRequiredFilter     RejectionReason = "REQUIRED_FILTER_MISSING"
 	ReasonStatementBlocklist RejectionReason = "STATEMENT_BLOCKLIST"
 	ReasonCostLimitBreach    RejectionReason = "COST_LIMIT_BREACH"
+	ReasonFunctionBlocklist  RejectionReason = "FUNCTION_BLOCKLIST"
+	ReasonSelectStarBlocked  RejectionReason = "SELECT_STAR_BLOCKED"
 )
 
 // rejectionResponse is the wire schema returned for rejected queries.
