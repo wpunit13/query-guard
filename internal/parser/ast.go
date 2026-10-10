@@ -1,11 +1,5 @@
 package parser
 
-import (
-	"strings"
-
-	"vitess.io/vitess/go/vt/sqlparser"
-)
-
 // ──────────────────────────────────────────────────────────────────────────────
 // AST Analysis result types
 // ──────────────────────────────────────────────────────────────────────────────
@@ -14,8 +8,9 @@ import (
 //
 // Tables are populated from the ORIGINAL SQL via a lightweight token scanner,
 // so 3-part qualified names (catalog.schema.table) are preserved for policy
-// matching. WhereColumns and CTEAliases are extracted from the normalized SQL
-// via vitess/sqlparser after stripping Trino-specific syntax.
+// matching. WhereColumns, WhereRefs, functions, and projection stars are
+// extracted from the same token stream by the shared dialect-neutral
+// extractor (extractor.go), steered by the dialect's keyword configuration.
 type AnalysisResult struct {
 	// Tables is the set of physical table names referenced (catalog.schema.table
 	// or schema.table), excluding CTE aliases.
@@ -41,6 +36,15 @@ type AnalysisResult struct {
 	// subqueries. Used for function-blocklist enforcement.
 	Functions []string
 
+	// TableFunctions lists table-valued function names (lowercased) invoked in
+	// FROM/JOIN position, e.g. merge('db','regex') or remote('host', db, table).
+	// A table function reads rows without naming a physical table, so table
+	// blocklists cannot see through it; policies deny them via
+	// rules.table_function_blocklist. Each entry is also present in Tables
+	// (recorded under the function name) so existing table_blocklist entries
+	// keep matching.
+	TableFunctions []string
+
 	// SelectAll is true when the statement projects `*` or `table.*` at the
 	// top level of a SELECT list. COUNT(*) and other aggregate arguments do
 	// NOT set this flag — only projection-level stars do.
@@ -64,333 +68,13 @@ type WhereRef struct {
 // ──────────────────────────────────────────────────────────────────────────────
 
 // Analyze parses the SQL string and extracts table names, WHERE column
-// references, and CTE aliases. Table names are extracted from the original
-// SQL via a lightweight token scanner (preserving 3-part Trino names).
-// WHERE columns and CTE aliases come from vitess/sqlparser after stripping
-// Trino-specific syntax via normalization. If parsing fails, tables are
-// still returned safely (fail-open design).
-func Analyze(sql string) (*AnalysisResult, error) {
-	class := Classify(sql)
-
-	result := &AnalysisResult{
-		StatementClass: class,
-		TableAliases:   make(map[string]string),
-	}
-
-	// Bypass statements don't need any analysis.
-	if IsBypass(class) {
-		return result, nil
-	}
-
-	// Normalize the SQL for vitess (strip Trino-specific syntax like
-	// 3-part qualified names) so we can extract WHERE columns and CTE aliases.
-	normalized := normalizeForVitess(sql)
-
-	parser := sqlparser.NewTestParser()
-	stmt, err := parser.Parse(normalized)
-	if err != nil {
-		// Fallback: extract what we can from the original SQL via raw scanner.
-		result.Tables = extractTableNamesRaw(sql, nil)
-		return result, nil
-	}
-
-	// Extract CTE aliases first (needed to filter the raw table scanner).
-	collectCTEAliases(stmt, result)
-
-	// Extract raw table names from the original SQL, skipping CTE aliases.
-	result.Tables = extractTableNamesRaw(sql, result.CTEAliases)
-
-	// Extract WHERE columns and remaining structure from the vitess AST.
-	switch s := stmt.(type) {
-	case *sqlparser.Select:
-		analyzeSelect(s, result)
-	case *sqlparser.Insert:
-		analyzeInsert(s, result)
-	case *sqlparser.Update:
-		analyzeUpdate(s, result)
-	case *sqlparser.Delete:
-		analyzeDelete(s, result)
-	case sqlparser.DDLStatement:
-		analyzeDDL(s, result)
-	}
-
-	return result, nil
-}
-
-// collectCTEAliases walks a vitess AST and populates result.CTEAliases
-// from any WITH clauses found. This must run before the raw table scanner
-// so CTE aliases can be excluded from the table list.
-func collectCTEAliases(stmt sqlparser.Statement, result *AnalysisResult) {
-	switch s := stmt.(type) {
-	case *sqlparser.Select:
-		if s.With != nil {
-			for _, cte := range s.With.CTEs {
-				result.CTEAliases = append(result.CTEAliases, cte.ID.String())
-				// Recurse into CTE subquery for nested CTEs
-				if ss, ok := cte.Subquery.(*sqlparser.Select); ok {
-					collectCTEAliases(ss, result)
-				}
-			}
-		}
-		// Also check subqueries in FROM
-		for _, te := range s.From {
-			if derived, ok := te.(*sqlparser.AliasedTableExpr); ok {
-				if sub, ok := derived.Expr.(*sqlparser.DerivedTable); ok {
-					if sel, ok := sub.Select.(*sqlparser.Select); ok {
-						collectCTEAliases(sel, result)
-					}
-				}
-			}
-		}
-	case *sqlparser.Insert:
-		if sel, ok := s.Rows.(*sqlparser.Select); ok {
-			collectCTEAliases(sel, result)
-		}
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// SELECT analysis (columns and CTEs only — tables from raw scanner)
-// ──────────────────────────────────────────────────────────────────────────────
-
-func analyzeSelect(sel *sqlparser.Select, result *AnalysisResult) {
-	// CTE aliases already collected by collectCTEAliases.
-	// Here we just recurse into CTE subqueries for WHERE columns.
-
-	// 1. Recurse into CTE subqueries for column references.
-	if sel.With != nil {
-		for _, cte := range sel.With.CTEs {
-			if ss, ok := cte.Subquery.(*sqlparser.Select); ok {
-				analyzeSelect(ss, result)
-			}
-		}
-	}
-
-	// 2. Extract WHERE column references.
-	if sel.Where != nil {
-		extractColumnsFromExpr(sel.Where.Expr, result)
-	}
-
-	// 3. Collect table aliases (needed to resolve qualified column refs).
-	for _, tableExpr := range sel.From {
-		collectTableAliases(tableExpr, result)
-	}
-
-	// 4. Walk FROM/JOIN for ON-clause column references only (not table names).
-	for _, tableExpr := range sel.From {
-		extractOnClauseColumns(tableExpr, result)
-	}
-
-	// 4b. Recurse into FROM derived tables (subqueries) so stars, functions,
-	// and column refs inside them are captured too.
-	for _, tableExpr := range sel.From {
-		if aliased, ok := tableExpr.(*sqlparser.AliasedTableExpr); ok {
-			if derived, ok := aliased.Expr.(*sqlparser.DerivedTable); ok {
-				if inner, ok := derived.Select.(*sqlparser.Select); ok {
-					analyzeSelect(inner, result)
-				}
-			}
-		}
-	}
-
-	// 5. Collect function calls and projection-level star expressions.
-	collectFunctionsAndStars(sel, result)
-}
-
-// collectFunctionsAndStars records function/UDF names (lowercased) from the
-// SELECT projections and WHERE clause, and flags projection-level star
-// expressions (`SELECT *`, `SELECT t.*`) in result.SelectAll.
+// references, table aliases, function names, and projection stars. Table
+// names are extracted from the original SQL via a lightweight token scanner
+// (preserving 3-part Trino names); the rest comes from the shared
+// dialect-neutral token extractor with the trino keyword configuration.
 //
-// Star detection deliberately inspects ONLY top-level SelectExprs entries —
-// never FuncExpr arguments — because vitess parses COUNT(*) as a FuncExpr
-// whose argument is a StarExpr, and aggregates must not be flagged.
-// (Note: in vitess a StarExpr is a SelectExpr but not an Expr, so a star can
-// only appear as a top-level projection entry.)
-// This pass is separate from extractColumnsFromExpr (which only runs on
-// WHERE/ON) so projection-list functions are captured too.
-func collectFunctionsAndStars(sel *sqlparser.Select, result *AnalysisResult) {
-	for _, expr := range sel.SelectExprs {
-		if _, isStar := expr.(*sqlparser.StarExpr); isStar {
-			result.SelectAll = true
-			continue
-		}
-		if aliased, ok := expr.(*sqlparser.AliasedExpr); ok {
-			collectFunctionsFromExpr(aliased.Expr, result)
-		}
-	}
-	if sel.Where != nil {
-		collectFunctionsFromExpr(sel.Where.Expr, result)
-	}
-}
-
-// collectFunctionsFromExpr walks an expression tree recording function names
-// (lowercased) into result.Functions, recursing into arguments and nested
-// expressions. It does not touch column collection or star detection.
-func collectFunctionsFromExpr(expr sqlparser.Expr, result *AnalysisResult) {
-	if expr == nil {
-		return
-	}
-	switch e := expr.(type) {
-	case *sqlparser.FuncExpr:
-		result.Functions = append(result.Functions, strings.ToLower(e.Name.String()))
-		for _, arg := range e.Exprs {
-			collectFunctionsFromExpr(arg, result)
-		}
-	case *sqlparser.ComparisonExpr:
-		collectFunctionsFromExpr(e.Left, result)
-		collectFunctionsFromExpr(e.Right, result)
-	case *sqlparser.AndExpr:
-		collectFunctionsFromExpr(e.Left, result)
-		collectFunctionsFromExpr(e.Right, result)
-	case *sqlparser.OrExpr:
-		collectFunctionsFromExpr(e.Left, result)
-		collectFunctionsFromExpr(e.Right, result)
-	case *sqlparser.NotExpr:
-		collectFunctionsFromExpr(e.Expr, result)
-	case *sqlparser.IsExpr:
-		collectFunctionsFromExpr(e.Left, result)
-	case *sqlparser.BetweenExpr:
-		collectFunctionsFromExpr(e.Left, result)
-		collectFunctionsFromExpr(e.From, result)
-		collectFunctionsFromExpr(e.To, result)
-	case *sqlparser.BinaryExpr:
-		collectFunctionsFromExpr(e.Left, result)
-		collectFunctionsFromExpr(e.Right, result)
-	case *sqlparser.UnaryExpr:
-		collectFunctionsFromExpr(e.Expr, result)
-	}
-}
-
-// collectTableAliases walks a FROM/JOIN table expression and records aliases
-// (alias -> physical table bare name) into result.TableAliases.
-func collectTableAliases(expr sqlparser.TableExpr, result *AnalysisResult) {
-	switch e := expr.(type) {
-	case *sqlparser.AliasedTableExpr:
-		if !e.As.IsEmpty() {
-			if tn, ok := e.Expr.(sqlparser.TableName); ok {
-				result.TableAliases[e.As.String()] = tn.Name.String()
-			}
-		}
-	case *sqlparser.JoinTableExpr:
-		collectTableAliases(e.LeftExpr, result)
-		collectTableAliases(e.RightExpr, result)
-	case *sqlparser.ParenTableExpr:
-		for _, inner := range e.Exprs {
-			collectTableAliases(inner, result)
-		}
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// INSERT / UPDATE / DELETE analysis
-// ──────────────────────────────────────────────────────────────────────────────
-
-func analyzeInsert(ins *sqlparser.Insert, result *AnalysisResult) {
-	// Tables already extracted by the raw scanner.
-
-	// INSERT ... SELECT may have a subquery with columns and CTEs.
-	if sel, ok := ins.Rows.(*sqlparser.Select); ok {
-		analyzeSelect(sel, result)
-	}
-}
-
-func analyzeUpdate(upd *sqlparser.Update, result *AnalysisResult) {
-	// Tables already extracted by the raw scanner.
-	if upd.Where != nil {
-		extractColumnsFromExpr(upd.Where.Expr, result)
-	}
-	for _, tableExpr := range upd.TableExprs {
-		extractOnClauseColumns(tableExpr, result)
-	}
-}
-
-func analyzeDelete(del *sqlparser.Delete, result *AnalysisResult) {
-	// Tables already extracted by the raw scanner.
-	if del.Where != nil {
-		extractColumnsFromExpr(del.Where.Expr, result)
-	}
-}
-
-func analyzeDDL(ddl sqlparser.DDLStatement, result *AnalysisResult) {
-	// Tables already extracted by the raw scanner.
-	_ = ddl
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// ON-clause column extraction (table-agnostic)
-// ──────────────────────────────────────────────────────────────────────────────
-
-// extractOnClauseColumns walks a TableExpr looking only for ON clause column
-// references in JOIN conditions. It does NOT extract table names — those are
-// handled by the raw token scanner.
-func extractOnClauseColumns(expr sqlparser.TableExpr, result *AnalysisResult) {
-	switch e := expr.(type) {
-	case *sqlparser.JoinTableExpr:
-		if e.Condition != nil && e.Condition.On != nil {
-			extractColumnsFromExpr(e.Condition.On, result)
-		}
-		extractOnClauseColumns(e.LeftExpr, result)
-		extractOnClauseColumns(e.RightExpr, result)
-	case *sqlparser.ParenTableExpr:
-		for _, inner := range e.Exprs {
-			extractOnClauseColumns(inner, result)
-		}
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Column extraction helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-// extractColumnsFromExpr recursively walks an expression tree and collects
-// column name references into result.WhereColumns.
-func extractColumnsFromExpr(expr sqlparser.Expr, result *AnalysisResult) {
-	if expr == nil {
-		return
-	}
-
-	switch e := expr.(type) {
-	case *sqlparser.ColName:
-		result.WhereColumns = append(result.WhereColumns, e.Name.String())
-		ref := WhereRef{Column: e.Name.String()}
-		if !e.Qualifier.IsEmpty() {
-			ref.Table = e.Qualifier.Name.String()
-		}
-		result.WhereRefs = append(result.WhereRefs, ref)
-
-	case *sqlparser.ComparisonExpr:
-		extractColumnsFromExpr(e.Left, result)
-		extractColumnsFromExpr(e.Right, result)
-
-	case *sqlparser.AndExpr:
-		extractColumnsFromExpr(e.Left, result)
-		extractColumnsFromExpr(e.Right, result)
-
-	case *sqlparser.OrExpr:
-		extractColumnsFromExpr(e.Left, result)
-		extractColumnsFromExpr(e.Right, result)
-
-	case *sqlparser.NotExpr:
-		extractColumnsFromExpr(e.Expr, result)
-
-	case *sqlparser.IsExpr:
-		extractColumnsFromExpr(e.Left, result)
-
-	case *sqlparser.FuncExpr:
-		for _, arg := range e.Exprs {
-			extractColumnsFromExpr(arg, result)
-		}
-
-	case *sqlparser.BetweenExpr:
-		extractColumnsFromExpr(e.Left, result)
-		extractColumnsFromExpr(e.From, result)
-		extractColumnsFromExpr(e.To, result)
-
-	case *sqlparser.BinaryExpr:
-		extractColumnsFromExpr(e.Left, result)
-		extractColumnsFromExpr(e.Right, result)
-
-	case *sqlparser.UnaryExpr:
-		extractColumnsFromExpr(e.Expr, result)
-	}
+// Fail-open: parsing never fails — statements the extractor cannot fully
+// understand still yield partial results (e.g. raw table extraction only).
+func Analyze(sql string) (*AnalysisResult, error) {
+	return analyzeWithDialect(sql, trinoKeywordSet), nil
 }

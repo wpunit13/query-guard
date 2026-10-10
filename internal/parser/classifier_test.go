@@ -89,6 +89,61 @@ func TestClassify_Explain(t *testing.T) {
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Executing EXPLAIN forms
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestSplitExecutingExplain(t *testing.T) {
+	cases := []struct {
+		sql   string
+		ok    bool
+		inner string
+	}{
+		{"EXPLAIN ANALYZE SELECT * FROM t", true, "SELECT * FROM t"},
+		{"EXPLAIN ANALYZE VERBOSE SELECT 1", true, "SELECT 1"},
+		{"explain analyze select 1", true, "select 1"},
+		{"EXPLAIN (TYPE EXECUTE) SELECT 1", true, "SELECT 1"},
+		{"EXPLAIN (TYPE EXECUTE, FORMAT JSON) SELECT 1", true, "SELECT 1"},
+		{"/* c */ EXPLAIN ANALYZE SELECT 1", true, "SELECT 1"},
+		// Planning-only forms stay bypasses.
+		{"EXPLAIN SELECT 1", false, ""},
+		{"EXPLAIN (TYPE IO, FORMAT JSON) SELECT 1", false, ""},
+		{"EXPLAIN (TYPE DISTRIBUTED) SELECT 1", false, ""},
+		{"EXPLAIN (FORMAT JSON) SELECT 1", false, ""},
+		{"SELECT 1", false, ""},
+		{"EXPLAINX SELECT 1", false, ""},
+	}
+	for _, tc := range cases {
+		inner, ok := SplitExecutingExplain(tc.sql)
+		if ok != tc.ok || (ok && inner != tc.inner) {
+			t.Errorf("SplitExecutingExplain(%q) = (%q, %v), want (%q, %v)", tc.sql, inner, ok, tc.inner, tc.ok)
+		}
+	}
+}
+
+func TestAnalyze_ExecutingExplainExtracted(t *testing.T) {
+	// An executing EXPLAIN must be extracted like an ordinary statement so
+	// Tier 1 can see its tables, functions, and stars.
+	r, err := Analyze("EXPLAIN ANALYZE SELECT * FROM tpch.tiny.lineitem")
+	if err != nil {
+		t.Fatalf("Analyze() unexpected error: %v", err)
+	}
+	if !contains(r.Tables, "tpch.tiny.lineitem") {
+		t.Errorf("Tables = %v, want it to contain tpch.tiny.lineitem", r.Tables)
+	}
+	if !r.SelectAll {
+		t.Error("SelectAll = false, want true")
+	}
+	// Planning-only EXPLAIN keeps the skip.
+	r, err = Analyze("EXPLAIN SELECT * FROM tpch.tiny.lineitem")
+	if err != nil {
+		t.Fatalf("Analyze() unexpected error: %v", err)
+	}
+	if len(r.Tables) != 0 {
+		t.Errorf("planning-only EXPLAIN extracted tables: %v", r.Tables)
+	}
+}
+
 func TestClassify_Use(t *testing.T) {
 	if c := Classify("USE default"); c != StatementUse {
 		t.Errorf("expected USE, got %s", c)
@@ -167,6 +222,10 @@ func TestIsBypass(t *testing.T) {
 		{StatementTruncate, false},
 		{StatementOther, false},
 		{StatementUnknown, false},
+		// ClickHouse SYSTEM/KILL are administration statements, not bypasses:
+		// policies deny them via rules.statement_blocklist.
+		{StatementSystem, false},
+		{StatementKill, false},
 	}
 	for _, tc := range tests {
 		got := IsBypass(tc.class)

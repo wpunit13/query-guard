@@ -66,6 +66,24 @@ curl -s -X POST http://localhost:8091/v1/statement \
 ```
 
 <details>
+<summary><strong>Red-team regression suite</strong></summary>
+
+`scripts/redteam-verify.sh` fires the full bypass battery from the 2026-10-09
+red-team exercise (see `REDTEAM_FINDINGS.md`) at both live harness guards and
+asserts the expected outcome for each — including anti-over-blocking checks
+that legit queries stay allowed:
+
+```bash
+scripts/redteam-verify.sh              # both engines (exit 1 on any miss)
+scripts/redteam-verify.sh trino        # trino only
+scripts/redteam-verify.sh clickhouse   # clickhouse only
+```
+
+Run it after any guard or policy change.
+
+</details>
+
+<details>
 <summary><strong>What the demo policy blocks / allows</strong></summary>
 
 | Query | Result |
@@ -168,14 +186,42 @@ All rules are **hot-reloadable** (edit `policy.yaml`, no restart),
 ```yaml
 server:
   port: 8090
+  # What happens to statements whose body exceeds the 8 MiB inspection cap:
+  # "forward" (default, fail-open) or "reject" (fail-closed). Comment padding
+  # past the cap is a known guard-evasion vector; security-critical policies
+  # should set reject.
+  oversized_body: reject
 
 upstream:
+  engine: trino          # trino | clickhouse | cockroachdb | snowflake (default trino)
   url: http://trino:8080
+
+preflight:
+  timeout: 2s
+  max_concurrent: 5
+  # What happens when the pre-flight itself cannot complete (timeout, upstream
+  # error, concurrency-gate saturation): true (default) forwards the query
+  # unguarded; false rejects it (fail-closed) for policies where the cost
+  # limits are mandatory.
+  fail_open: false
+  # Reject read queries whose plan yields no per-table estimates while they
+  # reference tables (views, table functions, aggregate-only plans such as
+  # count(*)). Default false: those queries are only warned about.
+  require_estimates: true
 
 rules:
   # Tables that may never be queried. Bare names match any catalog/schema.
   table_blocklist:
     - lineitem
+
+  # Table-valued functions that may not appear in FROM/JOIN position. A table
+  # function reads rows without naming a physical table (merge('db','regex'),
+  # remote('host', db, table), s3(...)), so table_blocklist cannot see through
+  # it. Empty = disabled.
+  table_function_blocklist:
+    - merge
+    - remote
+    - s3
 
   # Functions/UDFs that may not appear anywhere in a statement
   # (projections, WHERE, CTEs, subqueries).
@@ -188,13 +234,22 @@ rules:
     - wide_table
 
   # Required WHERE filters, scoped to exactly one schema.table
-  # (catalog optional; no bare-name/suffix matching).
+  # (catalog optional). Bare table names in the query are qualified with the
+  # request's session context (X-Trino-Catalog/X-Trino-Schema headers, or the
+  # ClickHouse database) before matching.
   required_filters:
     - catalog: finance          # optional; empty = any catalog
       schema: reporting
       table: daily_orders
       mode: any-of              # any-of | all-of (default all-of)
       columns: [ds, month, year]
+
+  # Statements that may never be sent. Statement classes: SELECT, INSERT,
+  # UPDATE, DELETE, CREATE, ALTER, DROP, TRUNCATE, CALL, SHOW, DESCRIBE,
+  # EXPLAIN, USE, SET, OPTIMIZE, SYSTEM, KILL, OTHER. ClickHouse SYSTEM and
+  # KILL are administration statements (SYSTEM SHUTDOWN, KILL QUERY) — they
+  # are NOT bypasses; list them here to deny them.
+  statement_blocklist: []
 
   cost_limits:
     # Table-scoped: scan bytes / rows for matching tables.
@@ -227,6 +282,10 @@ audit:
 | `COST_LIMIT_BREACH` | Scan-byte, row, or CPU-cost limit exceeded |
 | `FUNCTION_BLOCKLIST` | Blocked function/UDF used |
 | `SELECT_STAR_BLOCKED` | `SELECT *` on a restricted table |
+| `TABLE_FUNCTION_BLOCKLIST` | Blocked table-valued function in FROM/JOIN position |
+| `STATEMENT_TOO_LARGE` | Body over the inspection cap with `server.oversized_body: reject` |
+| `PREFLIGHT_FAILED` | Pre-flight could not complete with `preflight.fail_open: false` |
+| `PREFLIGHT_NO_ESTIMATES` | No per-table estimates with `preflight.require_estimates: true` |
 
 </details>
 
@@ -235,12 +294,35 @@ audit:
 
 - **Fail-open paths:** parser errors, pre-flight timeouts, concurrency-gate
   saturation, and bodies over the 8 MiB inspection cap are all forwarded
-  unguarded (and counted in metrics).
+  unguarded (and counted in metrics); each forward is logged with a
+  `query_excerpt` of the statement. Each path has a fail-closed opt-out:
+  `preflight.fail_open: false`, `server.oversized_body: reject`, and
+  `preflight.require_estimates: true` for estimate-less plans.
+- **Executing EXPLAIN forms are not bypasses:** `EXPLAIN ANALYZE [VERBOSE]`
+  and `EXPLAIN (TYPE EXECUTE)` run their inner statement, so Tier 1 checks
+  apply and Tier 2 pre-flights the inner query. Planning-only EXPLAIN forms
+  (`EXPLAIN`, `EXPLAIN (TYPE IO/LOGICAL/...)`) still bypass.
+- **ClickHouse SYSTEM/KILL are not bypasses:** they flow through Tier 1 and
+  can be denied via `statement_blocklist: [SYSTEM, KILL]`.
+- **Bare table names are qualified for required filters:** Trino references
+  are qualified with the `X-Trino-Catalog`/`X-Trino-Schema` request headers,
+  ClickHouse references with `X-ClickHouse-Database` (or the `?database=`
+  parameter, or `default`). Without a session context a bare name cannot be
+  qualified and required filters do not match it.
+- **Predicate subqueries are walked:** stars, functions, and WHERE columns
+  inside `IN (SELECT ...)` / `EXISTS (...)` are visible to Tier 1. Unqualified
+  columns inside such a subquery are attributed to the subquery's own FROM
+  table, so a name collision cannot satisfy an outer table's required filter.
 - **Hot reload:** rules and upstream URL reload live via fsnotify. Caveat:
   single-file bind mounts (as in `deploy/compose`) can miss editor renames —
   see `RUNBOOK.md`.
 - **`COUNT(*)` is never treated as `SELECT *`** — only projection-level stars
   are flagged.
+- **ClickHouse Tier 2 is rows-only**: `EXPLAIN ESTIMATE` has no scan-byte or
+  CPU estimate, so only `max_rows` limits are enforced against ClickHouse
+  (bytes/CPU limits are inert there). Tier 1 rules apply unchanged. A trailing
+  `FORMAT` clause on the client query is stripped from the shadow estimate so
+  it cannot break the pre-flight (the forwarded query is untouched).
 - **Required filters are table-attributed:** a predicate on another table in
   a join cannot satisfy a guarded table's filter.
 - **CPU cost cap is global-only** (CPU is not attributable per-table) and
@@ -381,8 +463,8 @@ overhead**, not real Trino EXPLAIN cost (which dominates in production).
 cmd/queryguard/            entrypoint, TLS listener, graceful shutdown
 internal/
   config/                  policy schema, validation, fsnotify hot-reload
-  parser/                  statement classifier + vitess AST/token analysis
-  engine/                  CostEvaluator interface + Trino EXPLAIN implementation
+  parser/                  statement classifier + dialect-aware token analysis
+  engine/                  engine registry + Trino/ClickHouse cost evaluators
   proxy/                   HTTP handler, reverse proxy, rejection responses
   telemetry/               Prometheus metrics
   ctxlog/                  request-ID correlation

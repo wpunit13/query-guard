@@ -36,7 +36,7 @@ const (
 // as a fail-open signal (forward the query) and may surface a saturation metric.
 var ErrPreflightConcurrency = errors.New("engine/trino: preflight concurrency limit reached")
 
-// TrinoEvaluator implements CostEvaluator for Trino clusters. It issues a
+// TrinoEvaluator implements Engine for Trino clusters. It issues a
 // shadow `EXPLAIN (TYPE IO, FORMAT JSON) <query>` request to the upstream
 // coordinator (mirroring all client headers 1:1) and parses the returned plan
 // to estimate scan bytes and rows.
@@ -48,6 +48,13 @@ type TrinoEvaluator struct {
 	sem         chan struct{}
 	logger      *slog.Logger
 	metrics     *telemetry.Metrics
+}
+
+// Register the Trino engine so engine.New resolves upstream.engine: trino.
+func init() {
+	Register(trinoEngineName, func(cfg *config.Config, client *http.Client) (Engine, error) {
+		return NewTrinoEvaluator(cfg, client), nil
+	})
 }
 
 // NewTrinoEvaluator builds a TrinoEvaluator from the shared, hot-reloadable
@@ -87,6 +94,12 @@ func NewTrinoEvaluator(cfg *config.Config, client *http.Client) *TrinoEvaluator 
 // Engine returns the engine name for telemetry labels.
 func (e *TrinoEvaluator) Engine() string {
 	return trinoEngineName
+}
+
+// StatementPath returns the guarded Trino coordinator endpoint. The proxy
+// handler intercepts POSTs to this path for Tier 1/2 evaluation.
+func (e *TrinoEvaluator) StatementPath() string {
+	return statementPath
 }
 
 // SetMetrics attaches a telemetry sink. Passing nil leaves telemetry
@@ -253,8 +266,12 @@ func (e *TrinoEvaluator) runStatement(ctx context.Context, startURI, method, bod
 
 // evaluateLimits checks estimated usage against the configured cost limits.
 // It returns (allowed, reason). A non-empty reason explains a rejection.
-func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, totalRows int64, scans []TableScan, cpuCost float64) (bool, string) {
-	p := e.cfg.Get()
+//
+// Shared by every engine's evaluator: engines without a byte or CPU estimate
+// pass 0 for those dimensions and the corresponding limits are skipped
+// (0 = disabled), degrading gracefully instead of blocking.
+func evaluateLimits(ctx context.Context, cfg *config.Config, logger *slog.Logger, metrics *telemetry.Metrics, totalScanBytes, totalRows int64, scans []TableScan, cpuCost float64) (bool, string) {
+	p := cfg.Get()
 
 	// Detect table-scoped limits that cannot be enforced because the plan
 	// produced no per-table estimates (aggregate-only plan or fallback path).
@@ -266,8 +283,8 @@ func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, tot
 		}
 	}
 	if hasTableLimits && len(scans) == 0 {
-		e.metrics.RecordPreflightNoTableEstimates()
-		e.logger.Warn("table-scoped cost limits configured but no per-table scan estimates were produced; table limits are not enforced",
+		metrics.RecordPreflightNoTableEstimates()
+		logger.Warn("table-scoped cost limits configured but no per-table scan estimates were produced; table limits are not enforced",
 			slog.String("request_id", ctxlog.FromContext(ctx)))
 	}
 
@@ -281,7 +298,7 @@ func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, tot
 		}
 	}
 	if hasCPULimit && cpuCost <= 0 {
-		e.logger.Warn("max_cpu_cost_per_query configured but the plan carries no CPU cost estimate; CPU limit is not enforced",
+		logger.Warn("max_cpu_cost_per_query configured but the plan carries no CPU cost estimate; CPU limit is not enforced",
 			slog.String("request_id", ctxlog.FromContext(ctx)))
 	}
 
@@ -317,6 +334,12 @@ func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, tot
 	}
 
 	return true, ""
+}
+
+// evaluateLimits runs the shared limit evaluation with this evaluator's
+// config, logger, and telemetry sink.
+func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, totalRows int64, scans []TableScan, cpuCost float64) (bool, string) {
+	return evaluateLimits(ctx, e.cfg, e.logger, e.metrics, totalScanBytes, totalRows, scans, cpuCost)
 }
 
 // tableMatches reports whether a fully-qualified scanned table name matches a
