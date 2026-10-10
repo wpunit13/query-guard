@@ -1,0 +1,50 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# query-guard ClickHouse test harness: ClickHouse 26.8 + query-guard proxy.
+#
+# Usage:
+#   scripts/docker-harness-clickhouse.sh start
+#   scripts/docker-harness-clickhouse.sh stop
+#
+# Ports (host -> container):
+#   ClickHouse : 8123 -> 8123  (HTTP interface)
+#   qg proxy   : 8092 -> 8090
+# ──────────────────────────────────────────────────────────────────────────────
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8
+    container_name: qg-clickhouse
+    environment:
+      # Bootstrap an authenticated user so the smoke test exercises real
+      # X-ClickHouse-User / X-ClickHouse-Key passthrough through the guard.
+      CLICKHOUSE_USER: qg
+      CLICKHOUSE_PASSWORD: qgpass
+    ports:
+      - "8123:8123"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - queryguard
+
+  query-guard:
+    build:
+      context: ../../..
+      dockerfile: deploy/Dockerfile
+    image: query-guard:harness
+    container_name: qg-proxy-ch
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "8092:8090"
+    volumes:
+      - ./policy.yaml:/etc/query-guard/policy.yaml:ro
+    networks:
+      - queryguard
+
+networks:
+  queryguard:
+    driver: bridge

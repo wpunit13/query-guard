@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,7 +21,12 @@ import (
 // Test doubles
 // ──────────────────────────────────────────────────────────────────────────────
 
-// fakeEvaluator is a configurable engine.CostEvaluator for tests.
+// statementPath is the guarded endpoint these tests POST to. The real path is
+// engine-owned (Engine.StatementPath); this mirrors the Trino default that
+// handlers fall back to.
+const statementPath = "/v1/statement"
+
+// fakeEvaluator is a configurable engine.Engine for tests.
 type fakeEvaluator struct {
 	result      engine.CostResult
 	err         error
@@ -44,6 +50,10 @@ func (f *fakeEvaluator) Evaluate(_ context.Context, query string, headers http.H
 
 func (f *fakeEvaluator) Engine() string {
 	return "fake"
+}
+
+func (f *fakeEvaluator) StatementPath() string {
+	return statementPath
 }
 
 func (f *fakeEvaluator) calls() int {
@@ -88,7 +98,7 @@ func (u *upstreamRecorder) snapshot() (method, path, body, auth string) {
 }
 
 // newTestHandler wires a Handler against a recording upstream.
-func newTestHandler(t *testing.T, policy *config.Policy, eval engine.CostEvaluator) (*Handler, *upstreamRecorder) {
+func newTestHandler(t *testing.T, policy *config.Policy, eval engine.Engine) (*Handler, *upstreamRecorder) {
 	u := newUpstreamRecorder(t, http.StatusOK)
 	policy.Upstream.URL = u.server.URL
 
@@ -852,6 +862,353 @@ func assertRejection(t *testing.T, rec *httptest.ResponseRecorder, wantReason Re
 	}
 	if resp.Reason != wantReason {
 		t.Errorf("reason = %q, want %q (body=%s)", resp.Reason, wantReason, rec.Body.String())
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Red-team fix regression tests (REDTEAM_FINDINGS.md)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// namedEvaluator adapts fakeEvaluator to report a specific engine name so
+// engine-keyed behavior (bare-name qualification) can be exercised.
+type namedEvaluator struct {
+	fakeEvaluator
+	name string
+}
+
+func (f *namedEvaluator) Engine() string { return f.name }
+
+func TestTableFunctionBlocked(t *testing.T) {
+	p := testPolicy()
+	p.Rules.TableFunctionBlocklist = []string{"merge", "remote"}
+	h, u := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM merge('default','^secret')", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonTableFunctionBlocklist)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("rejected query reached upstream: %q", body)
+	}
+
+	// Unlisted table functions still pass.
+	h2, u2 := newTestHandler(t, p, nil)
+	rec = doRequest(h2, http.MethodPost, statementPath, "SELECT * FROM numbers(10)", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u2.snapshot(); !strings.Contains(body, "numbers") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+}
+
+func TestTableFunctionBlocked_InJoin(t *testing.T) {
+	p := testPolicy()
+	p.Rules.TableFunctionBlocklist = []string{"remote"}
+	h, _ := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath,
+		"SELECT * FROM orders JOIN remote('h', 'db', 't') ON true", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonTableFunctionBlocklist)
+}
+
+func TestBareNameRequiredFilterQualified(t *testing.T) {
+	p := testPolicy()
+	p.Rules.RequiredFilters = []config.RequiredFilter{
+		{Catalog: "tpch", Schema: "tiny", Table: "orders", Mode: "any-of", Columns: []string{"orderdate"}},
+	}
+	eval := &namedEvaluator{fakeEvaluator: fakeEvaluator{result: engine.CostResult{Allowed: true}}, name: "trino"}
+	h, u := newTestHandler(t, p, eval)
+
+	// Bare name + session catalog/schema headers: qualified to tpch.tiny.orders
+	// and the required filter is enforced.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT orderkey FROM orders", map[string]string{
+		"X-Trino-Catalog": "tpch", "X-Trino-Schema": "tiny",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonRequiredFilter)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("rejected query reached upstream: %q", body)
+	}
+
+	// With the required filter present the query is allowed.
+	h2, u2 := newTestHandler(t, p, eval)
+	rec = doRequest(h2, http.MethodPost, statementPath, "SELECT orderkey FROM orders WHERE orderdate > X", map[string]string{
+		"X-Trino-Catalog": "tpch", "X-Trino-Schema": "tiny",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u2.snapshot(); !strings.Contains(body, "orders") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+
+	// Without session headers the bare name cannot be qualified (documented
+	// residual: the guard does not guess the session context).
+	h3, u3 := newTestHandler(t, p, eval)
+	rec = doRequest(h3, http.MethodPost, statementPath, "SELECT orderkey FROM orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no headers → no qualification); body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u3.snapshot(); !strings.Contains(body, "orders") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+}
+
+func TestBareNameRequiredFilterQualified_ClickHouse(t *testing.T) {
+	p := testPolicy()
+	p.Rules.RequiredFilters = []config.RequiredFilter{
+		{Schema: "default", Table: "events", Mode: "any-of", Columns: []string{"event_date"}},
+	}
+	eval := &namedEvaluator{fakeEvaluator: fakeEvaluator{result: engine.CostResult{Allowed: true}}, name: "clickhouse"}
+	h, _ := newTestHandler(t, p, eval)
+
+	// Bare name resolves against the default database: the required filter
+	// must be enforced.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM events", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonRequiredFilter)
+
+	// An explicit database header re-scopes the bare name.
+	h2, u2 := newTestHandler(t, p, eval)
+	rec = doRequest(h2, http.MethodPost, statementPath, "SELECT * FROM events", map[string]string{
+		"X-ClickHouse-Database": "other",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (other.events is not the guarded table); body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u2.snapshot(); !strings.Contains(body, "events") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+}
+
+func TestQueryParamStatementEvaluated(t *testing.T) {
+	p := testPolicy()
+	p.Rules.TableBlocklist = []string{"orders"}
+	h, u := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath+"?query=SELECT%20*%20FROM%20orders", "", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonTableBlocklist)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("blocked query reached upstream, body=%q", body)
+	}
+}
+
+func TestQueryParamGetEvaluated(t *testing.T) {
+	p := testPolicy()
+	p.Rules.TableBlocklist = []string{"orders"}
+	h, _ := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodGet, statementPath+"?query=SELECT%20*%20FROM%20orders", "", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonTableBlocklist)
+}
+
+func TestQueryParamInsertWithDataForwarded(t *testing.T) {
+	// ClickHouse INSERT-with-data: statement in the parameter, row data in the
+	// body. The data is not SQL, so it must forward untouched.
+	h, u := newTestHandler(t, testPolicy(), nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath+"?query=INSERT%20INTO%20orders%20FORMAT%20CSV", "1,'a'\n2,'b'\n", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u.snapshot(); body != "1,'a'\n2,'b'\n" {
+		t.Errorf("upstream body = %q, want the row data intact", body)
+	}
+}
+
+func TestQueryParamBodyDataBlocklisted(t *testing.T) {
+	// A blocklisted statement hidden in the body of a parameter request must
+	// not ride along uninspected.
+	p := testPolicy()
+	p.Rules.TableBlocklist = []string{"orders"}
+	h, _ := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath+"?query=INSERT%20INTO%20ok%20FORMAT%20CSV", "SELECT * FROM orders\n", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonTableBlocklist)
+}
+
+func TestOversizedBodyReject(t *testing.T) {
+	p := testPolicy()
+	p.Server.OversizedBody = "reject"
+	h, u := newTestHandler(t, p, nil)
+
+	padded := "/* " + strings.Repeat("a", maxStatementBodyBytes) + " */ SELECT * FROM orders"
+	rec := doRequest(h, http.MethodPost, statementPath, padded, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonStatementTooLarge)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("rejected query reached upstream: %q", body)
+	}
+}
+
+func TestOversizedBodyForwardByDefault(t *testing.T) {
+	// Default (forward) keeps the historical fail-open behavior.
+	h, u := newTestHandler(t, testPolicy(), nil)
+	padded := "/* " + strings.Repeat("a", maxStatementBodyBytes) + " */ SELECT * FROM orders"
+	rec := doRequest(h, http.MethodPost, statementPath, padded, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (default forwards); body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u.snapshot(); !strings.Contains(body, "SELECT * FROM orders") {
+		t.Errorf("oversized query not forwarded intact")
+	}
+}
+
+func TestPreflightFailClosed(t *testing.T) {
+	failClosed := false
+	p := testPolicy()
+	p.Preflight.FailOpen = &failClosed
+	h, u := newTestHandler(t, p, &fakeEvaluator{err: errors.New("upstream timeout")})
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM orders", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (fail-closed); body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonPreflightFailed)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("rejected query reached upstream: %q", body)
+	}
+
+	// Default (fail-open) forwards on the same error.
+	h2, u2 := newTestHandler(t, testPolicy(), &fakeEvaluator{err: errors.New("upstream timeout")})
+	rec = doRequest(h2, http.MethodPost, statementPath, "SELECT * FROM orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (default fail-open); body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u2.snapshot(); !strings.Contains(body, "orders") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+}
+
+func TestRequireEstimates(t *testing.T) {
+	p := testPolicy()
+	p.Preflight.RequireEstimates = true
+	h, u := newTestHandler(t, p, &fakeEvaluator{result: engine.CostResult{Allowed: true}})
+
+	// Tables referenced but no per-table estimates → reject.
+	rec := doRequest(h, http.MethodPost, statementPath, "SELECT * FROM orders", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonPreflightNoEstimates)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("rejected query reached upstream: %q", body)
+	}
+
+	// Estimates present → allowed.
+	h2, u2 := newTestHandler(t, p, &fakeEvaluator{result: engine.CostResult{
+		Allowed: true, TableScans: []engine.TableScan{{Table: "orders", Rows: 10}},
+	}})
+	rec = doRequest(h2, http.MethodPost, statementPath, "SELECT * FROM orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u2.snapshot(); !strings.Contains(body, "orders") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+
+	// No tables referenced (SELECT 1) → the check does not apply.
+	h3, u3 := newTestHandler(t, p, &fakeEvaluator{result: engine.CostResult{Allowed: true}})
+	rec = doRequest(h3, http.MethodPost, statementPath, "SELECT 1", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u3.snapshot(); !strings.Contains(body, "SELECT 1") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+}
+
+func TestExecutingExplainNotBypassed(t *testing.T) {
+	p := testPolicy()
+	p.Rules.TableBlocklist = []string{"lineitem"}
+	h, u := newTestHandler(t, p, &fakeEvaluator{result: engine.CostResult{Allowed: true}})
+
+	// EXPLAIN ANALYZE executes its inner query: the blocklist must fire.
+	rec := doRequest(h, http.MethodPost, statementPath, "EXPLAIN ANALYZE SELECT * FROM lineitem", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonTableBlocklist)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("rejected query reached upstream: %q", body)
+	}
+
+	// Tier 2 pre-flights the INNER statement, not the wrapper.
+	h2, u2 := newTestHandler(t, p, &fakeEvaluator{result: engine.CostResult{Allowed: true}})
+	rec = doRequest(h2, http.MethodPost, statementPath, "EXPLAIN ANALYZE VERBOSE SELECT * FROM orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if eval := u2; true {
+		_ = eval
+	}
+	if _, _, body, _ := u2.snapshot(); !strings.Contains(body, "EXPLAIN ANALYZE VERBOSE") {
+		t.Errorf("original query not forwarded intact: %q", body)
+	}
+
+	// Planning-only EXPLAIN keeps bypassing.
+	h3, u3 := newTestHandler(t, p, &fakeEvaluator{result: engine.CostResult{Allowed: true}})
+	rec = doRequest(h3, http.MethodPost, statementPath, "EXPLAIN (TYPE IO, FORMAT JSON) SELECT * FROM lineitem", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (planning-only EXPLAIN bypasses); body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, body, _ := u3.snapshot(); !strings.Contains(body, "lineitem") {
+		t.Errorf("query not forwarded: %q", body)
+	}
+}
+
+func TestExecutingExplainPreflightsInnerQuery(t *testing.T) {
+	p := testPolicy()
+	eval := &fakeEvaluator{result: engine.CostResult{Allowed: true}}
+	h, _ := newTestHandler(t, p, eval)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "EXPLAIN ANALYZE SELECT * FROM orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if eval.lastQuery != "SELECT * FROM orders" {
+		t.Errorf("pre-flighted query = %q, want the inner statement", eval.lastQuery)
+	}
+}
+
+func TestSystemStatementBlocklistable(t *testing.T) {
+	p := testPolicy()
+	p.Rules.StatementBlocklist = []string{"SYSTEM", "KILL"}
+	h, u := newTestHandler(t, p, nil)
+
+	rec := doRequest(h, http.MethodPost, statementPath, "SYSTEM FLUSH LOGS", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonStatementBlocklist)
+
+	rec = doRequest(h, http.MethodPost, statementPath, "KILL QUERY WHERE query_id = 'x'", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	assertRejection(t, rec, ReasonStatementBlocklist)
+	if _, _, body, _ := u.snapshot(); body != "" {
+		t.Errorf("rejected query reached upstream: %q", body)
 	}
 }
 

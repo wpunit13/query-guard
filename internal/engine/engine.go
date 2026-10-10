@@ -31,6 +31,19 @@ type CostEvaluator interface {
 	Engine() string
 }
 
+// Engine is the per-engine adapter for Tier 2 (pre-flight cost) plus the
+// routing seam. The proxy handler depends only on this interface, never on a
+// concrete engine; one process serves exactly one engine, selected by
+// upstream.engine via New.
+type Engine interface {
+	CostEvaluator
+
+	// StatementPath returns the engine endpoint that accepts queries
+	// (e.g. "/v1/statement" for Trino, "/" for ClickHouse). The handler
+	// intercepts POSTs (and GETs with a ?query= parameter) to this path.
+	StatementPath() string
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Result types
 // ──────────────────────────────────────────────────────────────────────────────

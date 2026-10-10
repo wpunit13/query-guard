@@ -39,10 +39,17 @@ func main() {
 	// Telemetry.
 	metrics := telemetry.NewMetrics(nil)
 
-	// Pre-flight cost evaluator (Trino, fail-open on errors). It reads the
-	// upstream and timeout from cfg on every evaluation, so those hot-reload.
-	evaluator := engine.NewTrinoEvaluator(cfg, nil)
-	evaluator.SetMetrics(metrics)
+	// Pre-flight cost evaluator, selected by upstream.engine via the engine
+	// registry (trino today; later engines register themselves in their own
+	// files). It reads the upstream and timeout from cfg on every evaluation,
+	// so those hot-reload.
+	evaluator, err := engine.New(cfg, p.Upstream.Engine, nil)
+	if err != nil {
+		logger.Error("failed to build cost evaluator",
+			slog.String("engine", p.Upstream.Engine), slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	engine.SetMetrics(evaluator, metrics)
 
 	// Core proxy handler.
 	handler, err := proxy.NewHandler(cfg, evaluator, logger)

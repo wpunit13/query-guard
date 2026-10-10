@@ -5,6 +5,9 @@ server:
   read_timeout: 30s
   write_timeout: 5m
   shutdown_grace_period: 10s
+  # Reject (instead of fail-open forward) statements padded past the 8 MiB
+  # inspection cap — comment padding is a known guard-evasion vector.
+  oversized_body: reject
 
 upstream:
   url: http://trino:8080
@@ -38,8 +41,11 @@ rules:
       table: orders
       max_scan_bytes: 500000
       max_rows: 0
+    # CPU cap sized above legit join/filter estimates (~550K in tpch.tiny)
+    # but below the cross-join monsters (~8M); the scanner fixes make the
+    # blocklist carry those cases now.
     - max_scan_bytes_per_query: 8000000
-      max_cpu_cost_per_query: 500000
+      max_cpu_cost_per_query: 2000000
 
 audit:
   log_rejections: true

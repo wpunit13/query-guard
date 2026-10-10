@@ -49,6 +49,11 @@ policy: |
     shutdown_grace_period: 10s
 
   upstream:
+    # engine selects the guarded database engine: trino (default),
+    # clickhouse, cockroachdb, or snowflake. One guard instance per engine.
+    # ClickHouse Tier 2 is rows-only (EXPLAIN ESTIMATE has no byte/CPU
+    # estimate) — configure max_rows limits for it.
+    engine: trino
     url: http://trino:8080
     timeout: 30s
 

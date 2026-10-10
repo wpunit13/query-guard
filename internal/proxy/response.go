@@ -17,12 +17,16 @@ const errorCodeLimitBreach = "QUERY_GUARD_LIMIT_BREACH"
 type RejectionReason string
 
 const (
-	ReasonTableBlocklist     RejectionReason = "TABLE_BLOCKLIST"
-	ReasonRequiredFilter     RejectionReason = "REQUIRED_FILTER_MISSING"
-	ReasonStatementBlocklist RejectionReason = "STATEMENT_BLOCKLIST"
-	ReasonCostLimitBreach    RejectionReason = "COST_LIMIT_BREACH"
-	ReasonFunctionBlocklist  RejectionReason = "FUNCTION_BLOCKLIST"
-	ReasonSelectStarBlocked  RejectionReason = "SELECT_STAR_BLOCKED"
+	ReasonTableBlocklist         RejectionReason = "TABLE_BLOCKLIST"
+	ReasonRequiredFilter         RejectionReason = "REQUIRED_FILTER_MISSING"
+	ReasonStatementBlocklist     RejectionReason = "STATEMENT_BLOCKLIST"
+	ReasonCostLimitBreach        RejectionReason = "COST_LIMIT_BREACH"
+	ReasonFunctionBlocklist      RejectionReason = "FUNCTION_BLOCKLIST"
+	ReasonSelectStarBlocked      RejectionReason = "SELECT_STAR_BLOCKED"
+	ReasonTableFunctionBlocklist RejectionReason = "TABLE_FUNCTION_BLOCKLIST"
+	ReasonStatementTooLarge      RejectionReason = "STATEMENT_TOO_LARGE"
+	ReasonPreflightFailed        RejectionReason = "PREFLIGHT_FAILED"
+	ReasonPreflightNoEstimates   RejectionReason = "PREFLIGHT_NO_ESTIMATES"
 )
 
 // rejectionResponse is the wire schema returned for rejected queries.
