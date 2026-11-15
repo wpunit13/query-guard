@@ -336,8 +336,10 @@ audit:
   (bytes/CPU limits are inert there). Tier 1 rules apply unchanged. A trailing
   `FORMAT` clause on the client query is stripped from the shadow estimate so
   it cannot break the pre-flight (the forwarded query is untouched).
-- **Required filters are table-attributed:** a predicate on another table in
-  a join cannot satisfy a guarded table's filter.
+- **Required filters are table-attributed** for qualified references: a
+  qualified predicate on another table in a join cannot satisfy a guarded
+  table's filter. An unqualified `WHERE col = …` is assumed to target the
+  guarded table, so qualify columns in joins to avoid ambiguity.
 - **CPU cost cap is global-only** (CPU is not attributable per-table) and
   fails open when a plan carries no CPU estimate.
 

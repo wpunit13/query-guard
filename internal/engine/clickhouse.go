@@ -148,7 +148,7 @@ func (e *ClickHouseEvaluator) Evaluate(ctx context.Context, query string, header
 
 	// No scan-byte or CPU estimate exists in EXPLAIN ESTIMATE: leave both at
 	// 0 so evaluateLimits skips those limits (rows-only enforcement).
-	result.Allowed, result.Reason = evaluateLimits(ctx, e.cfg, e.logger, e.metrics, 0, rows, scans, 0)
+	result.Allowed, result.Reason = evaluateLimits(ctx, e.cfg, e.logger, e.metrics, 0, scans, 0)
 	return result, nil
 }
 

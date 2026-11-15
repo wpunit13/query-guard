@@ -246,7 +246,7 @@ func TestEvaluateLimits_CPUMissingWarns(t *testing.T) {
 	e.cfg.Set(p)
 
 	// Plan with no CPU estimate: must fail-open (allow) — never block on 0.
-	allowed, reason := e.evaluateLimits(context.Background(), 1_000, 10, nil, 0)
+	allowed, reason := e.evaluateLimits(context.Background(), 1_000, nil, 0)
 	if !allowed {
 		t.Fatalf("expected fail-open allow when CPU estimate absent, reason=%q", reason)
 	}
@@ -264,7 +264,7 @@ func TestEvaluateLimits_NoTableEstimates_RecordsMetric(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
 	e.SetMetrics(metrics)
 
-	allowed, _ := e.evaluateLimits(context.Background(), 1_000_000, 1000, nil, 0)
+	allowed, _ := e.evaluateLimits(context.Background(), 1_000_000, nil, 0)
 	if !allowed {
 		t.Fatalf("expected fail-open allow, got blocked")
 	}
@@ -273,7 +273,7 @@ func TestEvaluateLimits_NoTableEstimates_RecordsMetric(t *testing.T) {
 	}
 
 	// With per-table scans present, the counter must NOT move.
-	allowed, _ = e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
+	allowed, _ = e.evaluateLimits(context.Background(), 1_000_000, []TableScan{
 		{Table: "hive.default.orders", ScanBytes: 500_000, Rows: 1000},
 	}, 0)
 	if !allowed {
@@ -286,7 +286,7 @@ func TestEvaluateLimits_NoTableEstimates_RecordsMetric(t *testing.T) {
 
 func TestEvaluateLimits_Allowed(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
-	allowed, reason := e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
+	allowed, reason := e.evaluateLimits(context.Background(), 1_000_000, []TableScan{
 		{Table: "hive.default.orders", ScanBytes: 500_000, Rows: 1000},
 	}, 0)
 	if !allowed {
@@ -296,7 +296,7 @@ func TestEvaluateLimits_Allowed(t *testing.T) {
 
 func TestEvaluateLimits_PerQueryLimitBreach(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
-	allowed, reason := e.evaluateLimits(context.Background(), 20_000_000, 1000, nil, 0)
+	allowed, reason := e.evaluateLimits(context.Background(), 20_000_000, nil, 0)
 	if allowed {
 		t.Fatalf("expected blocked, got allowed")
 	}
@@ -307,7 +307,7 @@ func TestEvaluateLimits_PerQueryLimitBreach(t *testing.T) {
 
 func TestEvaluateLimits_TableLimitBreach(t *testing.T) {
 	e := NewTrinoEvaluator(config.NewConfig(testPolicy()), nil)
-	allowed, reason := e.evaluateLimits(context.Background(), 1_000_000, 1000, []TableScan{
+	allowed, reason := e.evaluateLimits(context.Background(), 1_000_000, []TableScan{
 		{Table: "hive.default.orders", ScanBytes: 5_000_000, Rows: 1000},
 	}, 0)
 	if allowed {

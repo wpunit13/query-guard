@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -20,6 +21,7 @@ type Watcher struct {
 	cfg      *Config
 	path     string
 	done     chan struct{}
+	once     sync.Once
 	onReload func(*Policy) // optional callback invoked after every successful reload
 }
 
@@ -99,9 +101,10 @@ func (w *Watcher) Start(ctx context.Context) error {
 	}
 }
 
-// Shutdown signals the watcher goroutine to exit cleanly.
+// Shutdown signals the watcher goroutine to exit cleanly. Safe to call more
+// than once.
 func (w *Watcher) Shutdown() {
-	close(w.done)
+	w.once.Do(func() { close(w.done) })
 }
 
 // reload re-reads the policy file from disk and atomically swaps it into the

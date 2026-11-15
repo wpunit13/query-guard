@@ -518,14 +518,15 @@ func (h *Handler) qualifyBareTables(res *parser.AnalysisResult, r *http.Request)
 // for fail-open log lines where the full statement would be unwieldy.
 func queryExcerpt(query string, max int) string {
 	flat := strings.Join(strings.Fields(query), " ")
-	if len(flat) <= max {
+	r := []rune(flat)
+	if len(r) <= max {
 		return flat
 	}
-	return flat[:max] + "…"
+	return string(r[:max]) + "…"
 }
 
 // requiredFilterMatches reports whether a referenced table matches a required
-// filter entry. Unlike tableMatchesScope, matching is strict: schema.table
+// filter entry. Matching is strict: schema.table
 // must both be present in the reference (catalog too, when set) — no
 // suffix/bare-table breadth. Case-insensitive (Trino unquoted identifiers).
 func requiredFilterMatches(table string, rf config.RequiredFilter) bool {
@@ -586,26 +587,6 @@ func tableBlocklisted(table, entry string) bool {
 		return strings.EqualFold(parts[len(parts)-1], entry)
 	}
 	return false
-}
-
-// tableMatchesScope reports whether a scan table matches a catalog/schema/table
-// scope, matching on the rightmost components (suffix semantics).
-func tableMatchesScope(scanTable, catalog, schema, table string) bool {
-	parts := strings.Split(scanTable, ".")
-	if table != "" && !strings.EqualFold(parts[len(parts)-1], table) {
-		return false
-	}
-	if schema != "" {
-		if len(parts) < 2 || !strings.EqualFold(parts[len(parts)-2], schema) {
-			return false
-		}
-	}
-	if catalog != "" {
-		if len(parts) < 3 || !strings.EqualFold(parts[len(parts)-3], catalog) {
-			return false
-		}
-	}
-	return true
 }
 
 // tableHasFilter reports whether the guarded table is actually filtered on the

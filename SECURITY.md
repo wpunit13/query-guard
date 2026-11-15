@@ -17,6 +17,9 @@ and the limits you should understand before relying on it in production.
 - It is not authentication. It forwards `Authorization` and engine session
   headers 1:1 to the upstream and never decides who may connect. Anyone who
   can reach the guard can attempt the guarded endpoint.
+- It exposes `/metrics`, `/healthz`, and `/readyz` without authentication.
+  Treat the guard as inside the same trust boundary as the upstream; do not
+  expose it directly to untrusted clients.
 - It is not a general SQL firewall. Tier 1 is a hand-written tokenizer, not a
   grammar parser (see below).
 
