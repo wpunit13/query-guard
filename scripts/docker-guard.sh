@@ -55,7 +55,7 @@ rules:
     - catalog: tpch
       schema: tiny
       table: orders
-      column: orderdate
+      columns: [orderdate]
   cost_limits:
     - catalog: tpch
       schema: tiny
