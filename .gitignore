@@ -37,7 +37,8 @@ queryguard.log
 # GoReleaser local build output
 dist/
 
-# Markdown docs — keep only README.md tracked
+# Markdown docs — keep only README.md, RUNBOOK.md, and SECURITY.md tracked
 *.md
 !README.md
 !RUNBOOK.md
+!SECURITY.md

@@ -8,32 +8,39 @@ architecture see `README.md`; for the backlog see `NEXT_TASKS.md`.
 
 ## Core operating principle
 
-**query-guard fails open by default.** By design (blueprint principle #3), a
-safety tool must never cause platform downtime: parser errors, pre-flight
-timeouts, concurrency-gate saturation, and oversized bodies all result in the
-original query being **forwarded unguarded**. Consequences for operations:
+**Code defaults fail open; the shipped `policy.yaml` and Helm chart fail
+closed on two explicit paths.** Parser errors and pre-flight *measurement*
+failures forward the query unguarded by default (a safety tool must never
+cause downtime because it could not measure). The shipped image/chart set
+`preflight.fail_open: false` and `server.oversized_body: reject`, so a
+pre-flight that cannot complete — or a body over the inspection cap — is
+**rejected** instead of forwarded.
 
-- The guard failing does not page you about user-visible errors — you must
-  watch its metrics (below) to know it is degraded.
-- Silence is not health. A guard that rejects nothing may be broken, not
-  peaceful.
+Consequences for operations:
+
+- Watch the metrics (below). A guard that rejects nothing may be broken, not
+  peaceful; a guard that rejects everything may be misconfigured fail-closed.
+- The fail-closed knobs are explicit *policy*, not the guard's own resource
+  limits. See "Measurement caps" below.
 
 ### Fail-closed opt-outs
 
-Each fail-open path has a policy switch that turns it into a rejection for
-policies where enforcement is mandatory. All default to the historical
-fail-open behavior — nothing below fires unless configured:
+Every fail-open path has a switch that turns it into a rejection. Parser
+errors (dialect gaps) remain fail-open with no switch — a guard that cannot
+parse cannot safely reject either.
 
-| Fail-open path | Switch | Opt-in behavior |
-|---|---|---|
-| Pre-flight timeout / upstream error / gate saturation | `preflight.fail_open: false` | Query rejected `PREFLIGHT_FAILED` instead of forwarded |
-| Body over the 8 MiB inspection cap | `server.oversized_body: reject` | Query rejected `STATEMENT_TOO_LARGE` instead of forwarded |
-| Plan without per-table estimates (views, table functions, aggregate-only plans such as `count(*)`) | `preflight.require_estimates: true` | Query rejected `PREFLIGHT_NO_ESTIMATES` instead of silently unenforced |
+| Path | Switch | Default | Opt-in behavior |
+|---|---|---|---|
+| Pre-flight *measurement* failure (timeout, upstream error, bad JSON, gate saturation) | `preflight.fail_open` | `true` (forward) | `false` rejects `PREFLIGHT_FAILED` |
+| Plan *exceeds* `max_plan_bytes` / `max_pages` | `preflight.plan_too_large` | `forward` | `reject` rejects `PLAN_TOO_LARGE` |
+| Body *exceeds* `max_statement_bytes` | `server.oversized_body` | `forward` | `reject` rejects `STATEMENT_TOO_LARGE` |
+| Plan without per-table estimates (views, table functions, `count(*)`) | `preflight.require_estimates` | `false` | `true` rejects `PREFLIGHT_NO_ESTIMATES` |
 
-Parser errors (dialect gaps) remain fail-open with no switch — a guard that
-cannot parse cannot safely reject either. Every fail-open forward is logged at
-ERROR with a `query_excerpt` of the statement, so bypass attempts are
-attributable from the logs.
+The distinction that matters: **measurement failure** (couldn't reach or parse
+the upstream) is governed by `fail_open`; **plan too large** (a plan that is
+itself suspicious) is a policy signal governed by `plan_too_large`. The caps
+are tunable (see "Measurement caps"), so an oversized plan is never a
+hard-coded block — it is a decision you make.
 
 ## Engines & Tier 2 coverage
 
@@ -61,9 +68,86 @@ CPU cost), `FUNCTION_BLOCKLIST` (blocked function/UDF), `SELECT_STAR_BLOCKED`
 (`SELECT *` on a restricted table), `TABLE_FUNCTION_BLOCKLIST` (table-valued
 function listed in `rules.table_function_blocklist`), `STATEMENT_TOO_LARGE`
 (`server.oversized_body: reject`), `PREFLIGHT_FAILED`
-(`preflight.fail_open: false`), and `PREFLIGHT_NO_ESTIMATES`
-(`preflight.require_estimates: true`). The last four are fail-closed opt-outs
+(`preflight.fail_open: false`), `PLAN_TOO_LARGE`
+(`preflight.plan_too_large: reject`), and `PREFLIGHT_NO_ESTIMATES`
+(`preflight.require_estimates: true`). The last five are fail-closed opt-outs
 (see above) and never fire on a stock policy.
+
+## Measurement caps
+
+The pre-flight plan and the request body are read up to tunable caps so a
+misbehaving upstream or a pathological query cannot exhaust the guard. Hitting
+a cap is **not** a measurement failure — it is "too large", and the matching
+policy knob decides what happens.
+
+| Cap | Default | `0` means | Policy on exceed |
+|---|---|---|---|
+| `server.max_statement_bytes` | 8 MiB | no cap (buffer whole body) | `server.oversized_body` |
+| `preflight.max_plan_bytes` | 1 MiB | unlimited | `preflight.plan_too_large` |
+| `preflight.max_pages` | 64 | unlimited | `preflight.plan_too_large` |
+
+Raise or zero these during an incident without a rebuild. Zeroing a cap
+accepts its risk: `max_statement_bytes: 0` buffers the whole body (memory);
+`max_plan_bytes` / `max_pages: 0` read/poll the plan without bound.
+
+## Comprehensive policy example
+
+```yaml
+server:
+  port: 8090
+  read_timeout: 30s
+  write_timeout: 5m
+  shutdown_grace_period: 10s
+  # Body inspection cap (0 = no cap). Bodies past it follow oversized_body.
+  max_statement_bytes: 8388608
+  # "forward" (fail-open) | "reject" (STATEMENT_TOO_LARGE)
+  oversized_body: reject
+
+upstream:
+  engine: trino              # trino | clickhouse | cockroachdb | snowflake
+  url: http://trino:8080
+  timeout: 30s
+
+preflight:
+  timeout: 2s
+  max_concurrent: 5
+  # Measurement failure → forward (true) or reject (false). Code default true;
+  # the shipped image/chart set false.
+  fail_open: false
+  # Plan read/poll caps (0 = unlimited). Exceeding them is "plan too large",
+  # governed by plan_too_large — not by fail_open.
+  max_plan_bytes: 1048576
+  max_pages: 64
+  # "forward" (fail-open) | "reject" (PLAN_TOO_LARGE)
+  plan_too_large: forward
+  # Reject read queries whose plan has no per-table estimates (views, table
+  # functions, count(*)). Default false.
+  require_estimates: true
+
+rules:
+  table_blocklist: [lineitem]
+  required_filters:
+    - catalog: tpch
+      schema: tiny
+      table: orders
+      mode: any-of
+      columns: [orderdate]
+  cost_limits:
+    - catalog: tpch
+      schema: tiny
+      table: orders
+      max_scan_bytes: 5000000
+      max_rows: 20000
+    - max_scan_bytes_per_query: 8000000
+
+audit:
+  log_rejections: true
+  snapshot_plan: true
+
+telemetry:
+  enabled: true
+  path: /metrics
+```
 
 ## Metrics reference
 

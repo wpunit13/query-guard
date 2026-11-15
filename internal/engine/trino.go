@@ -199,7 +199,20 @@ func (e *TrinoEvaluator) runStatement(ctx context.Context, startURI, method, bod
 	curBody := body
 	var cells []string
 
-	for {
+	// Measurement caps, configurable so operators can raise or disable them
+	// during a production incident. 0 = unlimited.
+	maxPages := 64
+	maxBytes := int64(1 << 20)
+	if e.cfg != nil {
+		p := e.cfg.Get()
+		maxPages = p.Preflight.EffectiveMaxPages()
+		maxBytes = p.Preflight.EffectiveMaxPlanBytes()
+	}
+
+	for page := 0; ; page++ {
+		if maxPages > 0 && page >= maxPages {
+			return nil, fmt.Errorf("%w: exceeded %d pages", ErrPlanTooLarge, maxPages)
+		}
 		var reqBody io.Reader
 		if curMethod == http.MethodPost {
 			reqBody = strings.NewReader(curBody)
@@ -218,8 +231,16 @@ func (e *TrinoEvaluator) runStatement(ctx context.Context, startURI, method, bod
 		if err != nil {
 			return nil, err
 		}
-		respBody, _ := io.ReadAll(resp.Body)
+		var respBody []byte
+		if maxBytes == 0 {
+			respBody, _ = io.ReadAll(resp.Body)
+		} else {
+			respBody, _ = io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+		}
 		resp.Body.Close()
+		if maxBytes > 0 && int64(len(respBody)) > maxBytes {
+			return nil, fmt.Errorf("%w: plan exceeds %d bytes", ErrPlanTooLarge, maxBytes)
+		}
 
 		if resp.StatusCode != http.StatusOK {
 			// Trino may respond with an HTML error page (e.g. 406 for

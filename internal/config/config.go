@@ -49,9 +49,13 @@ type ServerConfig struct {
 	ShutdownGrace time.Duration `yaml:"shutdown_grace_period"`
 	TLS           TLSConfig     `yaml:"tls"`
 	// OversizedBody: "forward" (default, fail-open) or "reject"
-	// (fail-closed, 400 STATEMENT_TOO_LARGE) for bodies past the 8 MiB
-	// inspection cap. Comment padding past the cap is a guard-evasion vector.
+	// (fail-closed, 400 STATEMENT_TOO_LARGE) for bodies past the inspection
+	// cap. Comment padding past the cap is a guard-evasion vector.
 	OversizedBody string `yaml:"oversized_body"`
+	// MaxStatementBytes caps how much of a statement body is buffered for
+	// inspection. nil = 8 MiB default; 0 = no cap (buffer the whole body);
+	// positive = cap. Bodies past the cap follow OversizedBody.
+	MaxStatementBytes *int64 `yaml:"max_statement_bytes"`
 }
 
 // TLSConfig configures native HTTPS on the proxy listener. When CertFile and
@@ -89,6 +93,16 @@ type PreflightConfig struct {
 	// per-table estimates while the statement references tables (views,
 	// table functions, engines without statistics). Default false.
 	RequireEstimates bool `yaml:"require_estimates"`
+	// MaxPlanBytes caps how much of the pre-flight EXPLAIN response is read.
+	// nil = 1 MiB default; 0 = unlimited; positive = cap.
+	MaxPlanBytes *int64 `yaml:"max_plan_bytes"`
+	// MaxPages caps how many Trino nextUri pages are polled for one
+	// pre-flight. nil = 64 default; 0 = unlimited; positive = cap.
+	MaxPages *int `yaml:"max_pages"`
+	// PlanTooLarge decides what happens when the plan exceeds MaxPlanBytes
+	// or MaxPages: "forward" (default, fail-open) or "reject"
+	// (400 PLAN_TOO_LARGE). Measurement failures still follow FailOpen.
+	PlanTooLarge string `yaml:"plan_too_large"`
 }
 
 // RulesConfig contains all static and cost-based enforcement rules.
@@ -243,6 +257,21 @@ func setDefaults(p *Policy) {
 		t := true
 		p.Preflight.FailOpen = &t
 	}
+	if p.Server.MaxStatementBytes == nil {
+		v := int64(8 << 20)
+		p.Server.MaxStatementBytes = &v
+	}
+	if p.Preflight.MaxPlanBytes == nil {
+		v := int64(1 << 20)
+		p.Preflight.MaxPlanBytes = &v
+	}
+	if p.Preflight.MaxPages == nil {
+		v := 64
+		p.Preflight.MaxPages = &v
+	}
+	if p.Preflight.PlanTooLarge == "" {
+		p.Preflight.PlanTooLarge = "forward"
+	}
 }
 
 // supportedEngines lists the engines upstream.engine may select. Spark and
@@ -324,5 +353,47 @@ func (p *Policy) Validate() error {
 	default:
 		return fmt.Errorf("server.oversized_body must be \"forward\" or \"reject\", got %q", p.Server.OversizedBody)
 	}
+
+	if p.Server.MaxStatementBytes != nil && *p.Server.MaxStatementBytes < 0 {
+		return fmt.Errorf("server.max_statement_bytes must be >= 0 (0 disables the cap)")
+	}
+	if p.Preflight.MaxPlanBytes != nil && *p.Preflight.MaxPlanBytes < 0 {
+		return fmt.Errorf("preflight.max_plan_bytes must be >= 0 (0 = unlimited)")
+	}
+	if p.Preflight.MaxPages != nil && *p.Preflight.MaxPages < 0 {
+		return fmt.Errorf("preflight.max_pages must be >= 0 (0 = unlimited)")
+	}
+	switch p.Preflight.PlanTooLarge {
+	case "", "forward", "reject":
+		// valid (empty is filled by setDefaults)
+	default:
+		return fmt.Errorf("preflight.plan_too_large must be \"forward\" or \"reject\", got %q", p.Preflight.PlanTooLarge)
+	}
 	return nil
+}
+
+// EffectiveMaxStatementBytes returns the body inspection cap (8 MiB default,
+// 0 = no cap).
+func (s ServerConfig) EffectiveMaxStatementBytes() int64 {
+	if s.MaxStatementBytes == nil {
+		return 8 << 20
+	}
+	return *s.MaxStatementBytes
+}
+
+// EffectiveMaxPlanBytes returns the pre-flight plan read cap (1 MiB default,
+// 0 = unlimited).
+func (p PreflightConfig) EffectiveMaxPlanBytes() int64 {
+	if p.MaxPlanBytes == nil {
+		return 1 << 20
+	}
+	return *p.MaxPlanBytes
+}
+
+// EffectiveMaxPages returns the pre-flight page cap (64 default, 0 = unlimited).
+func (p PreflightConfig) EffectiveMaxPages() int {
+	if p.MaxPages == nil {
+		return 64
+	}
+	return *p.MaxPages
 }

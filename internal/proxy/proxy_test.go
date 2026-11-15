@@ -766,7 +766,7 @@ func TestTableBlocklisted_CaseInsensitive(t *testing.T) {
 func TestOversizedBody_FailsOpen(t *testing.T) {
 	h, u := newTestHandler(t, testPolicy(), nil)
 
-	big := strings.Repeat("a", maxStatementBodyBytes+1)
+	big := strings.Repeat("a", (8<<20)+1)
 	req := httptest.NewRequest(http.MethodPost, statementPath, strings.NewReader(big))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -791,6 +791,41 @@ func TestReadyz_UpstreamDown(t *testing.T) {
 	rec := doRequest(h, http.MethodGet, "/readyz", "", nil)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("readyz status = %d, want 503 when upstream is down", rec.Code)
+	}
+}
+
+func TestReadyz_EngineAwarePath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ping" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	// ClickHouse probes /ping.
+	p := testPolicy()
+	p.Upstream.URL = srv.URL
+	ch := &namedEvaluator{fakeEvaluator: fakeEvaluator{}, name: "clickhouse"}
+	h, err := NewHandler(config.NewConfig(p), ch, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewHandler (clickhouse): %v", err)
+	}
+	if rec := doRequest(h, http.MethodGet, "/readyz", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("clickhouse readyz = %d, want 200 via /ping", rec.Code)
+	}
+
+	// Trino probes /v1/info, which the stub 404s, so readyz reports 503.
+	p2 := testPolicy()
+	p2.Upstream.URL = srv.URL
+	tr := &namedEvaluator{fakeEvaluator: fakeEvaluator{}, name: "trino"}
+	h2, err := NewHandler(config.NewConfig(p2), tr, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewHandler (trino): %v", err)
+	}
+	if rec := doRequest(h2, http.MethodGet, "/readyz", "", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("trino readyz = %d, want 503 via /v1/info", rec.Code)
 	}
 }
 
@@ -1050,7 +1085,7 @@ func TestOversizedBodyReject(t *testing.T) {
 	p.Server.OversizedBody = "reject"
 	h, u := newTestHandler(t, p, nil)
 
-	padded := "/* " + strings.Repeat("a", maxStatementBodyBytes) + " */ SELECT * FROM orders"
+	padded := "/* " + strings.Repeat("a", 8<<20) + " */ SELECT * FROM orders"
 	rec := doRequest(h, http.MethodPost, statementPath, padded, nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
@@ -1064,7 +1099,7 @@ func TestOversizedBodyReject(t *testing.T) {
 func TestOversizedBodyForwardByDefault(t *testing.T) {
 	// Default (forward) keeps the historical fail-open behavior.
 	h, u := newTestHandler(t, testPolicy(), nil)
-	padded := "/* " + strings.Repeat("a", maxStatementBodyBytes) + " */ SELECT * FROM orders"
+	padded := "/* " + strings.Repeat("a", 8<<20) + " */ SELECT * FROM orders"
 	rec := doRequest(h, http.MethodPost, statementPath, padded, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (default forwards); body=%s", rec.Code, rec.Body.String())

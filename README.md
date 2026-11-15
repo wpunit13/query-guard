@@ -191,6 +191,9 @@ server:
   # past the cap is a known guard-evasion vector; security-critical policies
   # should set reject.
   oversized_body: reject
+  # How much of a statement body is buffered for inspection (default 8 MiB).
+  # 0 = no cap (buffer the whole body, never trigger oversized_body).
+  max_statement_bytes: 8388608
 
 upstream:
   engine: trino          # trino | clickhouse | cockroachdb | snowflake (default trino)
@@ -208,6 +211,15 @@ preflight:
   # reference tables (views, table functions, aggregate-only plans such as
   # count(*)). Default false: those queries are only warned about.
   require_estimates: true
+  # Measurement caps (0 = unlimited). Exceeding these is NOT a measurement
+  # failure — it is "plan too large", governed by plan_too_large below.
+  max_plan_bytes: 1048576   # how much EXPLAIN JSON to read
+  max_pages: 64             # how many Trino nextUri pages to poll
+  # What to do when the plan exceeds the caps above: "forward" (default,
+  # fail-open) or "reject" (400 PLAN_TOO_LARGE). A too-large plan is a policy
+  # signal, separate from a preflight measurement failure (governed by
+  # fail_open).
+  plan_too_large: forward
 
 rules:
   # Tables that may never be queried. Bare names match any catalog/schema.
@@ -286,6 +298,7 @@ audit:
 | `STATEMENT_TOO_LARGE` | Body over the inspection cap with `server.oversized_body: reject` |
 | `PREFLIGHT_FAILED` | Pre-flight could not complete with `preflight.fail_open: false` |
 | `PREFLIGHT_NO_ESTIMATES` | No per-table estimates with `preflight.require_estimates: true` |
+| `PLAN_TOO_LARGE` | Plan exceeded `preflight.max_plan_bytes`/`max_pages` with `preflight.plan_too_large: reject` |
 
 </details>
 
@@ -329,6 +342,74 @@ audit:
   fails open when a plan carries no CPU estimate.
 
 </details>
+
+---
+
+## Deployment & configuration overrides
+
+Every deployment reads a `policy.yaml`. How you supply or override it depends
+on the mode.
+
+### Helm chart
+
+The chart renders `.Values.policy` (a single YAML string) into a ConfigMap
+mounted at `/etc/query-guard/policy.yaml`. Because `policy` is one literal
+string, you override it **as a whole** — you cannot `--set` a single nested key.
+
+Override with a values file (copy the `policy:` block and change one line):
+
+```bash
+helm upgrade --install query-guard ./deploy/helm -f my-values.yaml
+```
+
+Or keep the policy in its own file and pass it as the value:
+
+```bash
+helm upgrade --install query-guard ./deploy/helm --set-file policy=./my-policy.yaml
+```
+
+### Container image (no Helm)
+
+The image bakes the repo's `policy.yaml` into `/etc/query-guard/policy.yaml`
+(`CMD -config /etc/query-guard/policy.yaml`). Override at runtime by mounting
+your own file over that exact path:
+
+```bash
+docker run -p 8090:8090 \
+  -v "$(pwd)/my-policy.yaml:/etc/query-guard/policy.yaml:ro" \
+  ghcr.io/wpunit13/query-guard:latest
+```
+
+Kubernetes (raw pod):
+
+```yaml
+volumes:
+  - name: policy
+    configMap:
+      name: my-policy
+containers:
+  - name: query-guard
+    image: ghcr.io/wpunit13/query-guard:latest
+    volumeMounts:
+      - name: policy
+        mountPath: /etc/query-guard/policy.yaml
+        subPath: policy.yaml
+        readOnly: true
+```
+
+### Knobs: meaning, default, how to pass
+
+| Key | Meaning | Code default | Shipped chart/image |
+|---|---|---|---|
+| `preflight.fail_open` | measurement failure → forward / reject | `true` (forward) | `false` (reject) |
+| `preflight.plan_too_large` | plan over cap → forward / reject | `forward` | `forward` |
+| `server.oversized_body` | body over cap → forward / reject | `forward` | `reject` |
+| `server.max_statement_bytes` | body inspection cap | `8388608` (8 MiB) | same |
+| `preflight.max_plan_bytes` | preflight plan read cap | `1048576` (1 MiB) | same |
+| `preflight.max_pages` | Trino nextUri page cap | `64` | same |
+
+All caps accept `0` = unlimited / no cap. Pass them the same way as any other
+policy key: inside the `policy:` string (Helm) or the mounted file (image).
 
 ---
 

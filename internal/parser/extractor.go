@@ -168,6 +168,9 @@ func walkTokens(tokens []string, kw *keywordSet, result *AnalysisResult) {
 	inPredicate := false
 	// expectTable is true after FROM/JOIN/INTO/TABLE/UPDATE.
 	expectTable := false
+	// inFromList is true while scanning a FROM/JOIN relation list, so a
+	// comma separates relations (FROM a, b) rather than ending the clause.
+	inFromList := false
 	// pendingAlias is true after a table reference, waiting for a possible
 	// alias token (with or without AS).
 	pendingAlias := false
@@ -228,12 +231,15 @@ func walkTokens(tokens []string, kw *keywordSet, result *AnalysisResult) {
 				// (Re)enter a predicate section (WHERE, PREWHERE, ON).
 				inPredicate = true
 				pendingAlias = false
+				inFromList = false
 			case kw.boundaries[up]:
 				inPredicate = false
 				pendingAlias = false
+				inFromList = false
 				switch up {
 				case "FROM", "INTO", "TABLE", "UPDATE", "JOIN":
 					expectTable = true
+					inFromList = true
 				case "SELECT":
 					projStack = append(projStack, depth)
 				}
@@ -253,6 +259,13 @@ func walkTokens(tokens []string, kw *keywordSet, result *AnalysisResult) {
 		}
 
 		if !isIdentToken(tok) {
+			if tok == "," && inFromList {
+				// Comma between relations in a FROM/JOIN list: the next
+				// identifier is another table, not the end of the clause.
+				expectTable = true
+				pendingAlias = false
+				continue
+			}
 			// Numbers, strings, operators — irrelevant; they also end any
 			// pending table/alias expectation.
 			expectTable = false

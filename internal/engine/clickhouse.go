@@ -225,9 +225,21 @@ func (e *ClickHouseEvaluator) postQuery(ctx context.Context, uri, query string, 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	maxBytes := int64(1 << 20)
+	if e.cfg != nil {
+		maxBytes = e.cfg.Get().Preflight.EffectiveMaxPlanBytes()
+	}
+	var respBody []byte
+	if maxBytes == 0 {
+		respBody, err = io.ReadAll(resp.Body)
+	} else {
+		respBody, err = io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	}
 	if err != nil {
 		return nil, err
+	}
+	if maxBytes > 0 && int64(len(respBody)) > maxBytes {
+		return nil, fmt.Errorf("%w: plan exceeds %d bytes", ErrPlanTooLarge, maxBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
