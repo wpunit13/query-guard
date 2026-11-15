@@ -168,7 +168,7 @@ func (e *TrinoEvaluator) Evaluate(ctx context.Context, query string, headers htt
 	result.EstimatedCPUCost = cpuCost
 	result.TableScans = scans
 
-	result.Allowed, result.Reason = e.evaluateLimits(ctx, scanBytes, rows, scans, cpuCost)
+	result.Allowed, result.Reason = e.evaluateLimits(ctx, scanBytes, scans, cpuCost)
 	return result, nil
 }
 
@@ -199,7 +199,20 @@ func (e *TrinoEvaluator) runStatement(ctx context.Context, startURI, method, bod
 	curBody := body
 	var cells []string
 
-	for {
+	// Measurement caps, configurable so operators can raise or disable them
+	// during a production incident. 0 = unlimited.
+	maxPages := 64
+	maxBytes := int64(1 << 20)
+	if e.cfg != nil {
+		p := e.cfg.Get()
+		maxPages = p.Preflight.EffectiveMaxPages()
+		maxBytes = p.Preflight.EffectiveMaxPlanBytes()
+	}
+
+	for page := 0; ; page++ {
+		if maxPages > 0 && page >= maxPages {
+			return nil, fmt.Errorf("%w: exceeded %d pages", ErrPlanTooLarge, maxPages)
+		}
 		var reqBody io.Reader
 		if curMethod == http.MethodPost {
 			reqBody = strings.NewReader(curBody)
@@ -218,8 +231,16 @@ func (e *TrinoEvaluator) runStatement(ctx context.Context, startURI, method, bod
 		if err != nil {
 			return nil, err
 		}
-		respBody, _ := io.ReadAll(resp.Body)
+		var respBody []byte
+		if maxBytes == 0 {
+			respBody, _ = io.ReadAll(resp.Body)
+		} else {
+			respBody, _ = io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+		}
 		resp.Body.Close()
+		if maxBytes > 0 && int64(len(respBody)) > maxBytes {
+			return nil, fmt.Errorf("%w: plan exceeds %d bytes", ErrPlanTooLarge, maxBytes)
+		}
 
 		if resp.StatusCode != http.StatusOK {
 			// Trino may respond with an HTML error page (e.g. 406 for
@@ -270,7 +291,7 @@ func (e *TrinoEvaluator) runStatement(ctx context.Context, startURI, method, bod
 // Shared by every engine's evaluator: engines without a byte or CPU estimate
 // pass 0 for those dimensions and the corresponding limits are skipped
 // (0 = disabled), degrading gracefully instead of blocking.
-func evaluateLimits(ctx context.Context, cfg *config.Config, logger *slog.Logger, metrics *telemetry.Metrics, totalScanBytes, totalRows int64, scans []TableScan, cpuCost float64) (bool, string) {
+func evaluateLimits(ctx context.Context, cfg *config.Config, logger *slog.Logger, metrics *telemetry.Metrics, totalScanBytes int64, scans []TableScan, cpuCost float64) (bool, string) {
 	p := cfg.Get()
 
 	// Detect table-scoped limits that cannot be enforced because the plan
@@ -338,8 +359,8 @@ func evaluateLimits(ctx context.Context, cfg *config.Config, logger *slog.Logger
 
 // evaluateLimits runs the shared limit evaluation with this evaluator's
 // config, logger, and telemetry sink.
-func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes, totalRows int64, scans []TableScan, cpuCost float64) (bool, string) {
-	return evaluateLimits(ctx, e.cfg, e.logger, e.metrics, totalScanBytes, totalRows, scans, cpuCost)
+func (e *TrinoEvaluator) evaluateLimits(ctx context.Context, totalScanBytes int64, scans []TableScan, cpuCost float64) (bool, string) {
+	return evaluateLimits(ctx, e.cfg, e.logger, e.metrics, totalScanBytes, scans, cpuCost)
 }
 
 // tableMatches reports whether a fully-qualified scanned table name matches a

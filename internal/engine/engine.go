@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"net/http"
 )
 
@@ -43,6 +44,12 @@ type Engine interface {
 	// intercepts POSTs (and GETs with a ?query= parameter) to this path.
 	StatementPath() string
 }
+
+// ErrPlanTooLarge is returned when the pre-flight plan exceeds the configured
+// MaxPlanBytes or MaxPages. The caller applies the plan_too_large policy
+// (forward or reject) rather than the fail_open policy, because an oversized
+// plan is a policy signal, not a measurement failure.
+var ErrPlanTooLarge = errors.New("engine: preflight plan exceeds configured size limit")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Result types

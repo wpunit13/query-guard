@@ -27,6 +27,7 @@ const (
 	ReasonStatementTooLarge      RejectionReason = "STATEMENT_TOO_LARGE"
 	ReasonPreflightFailed        RejectionReason = "PREFLIGHT_FAILED"
 	ReasonPreflightNoEstimates   RejectionReason = "PREFLIGHT_NO_ESTIMATES"
+	ReasonPlanTooLarge           RejectionReason = "PLAN_TOO_LARGE"
 )
 
 // rejectionResponse is the wire schema returned for rejected queries.

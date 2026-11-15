@@ -4,6 +4,7 @@ server:
   read_timeout: 30s
   write_timeout: 5m
   shutdown_grace_period: 10s
+  oversized_body: reject
 
 upstream:
   url: http://localhost:8082
@@ -22,6 +23,7 @@ upstream:
 preflight:
   timeout: 2s
   max_concurrent: 5
+  fail_open: false
 
 rules:
   # Tier 1a: tables that may never be queried.

@@ -55,6 +55,16 @@ func TestExtract_ExplicitAliasWithAS(t *testing.T) {
 	}
 }
 
+func TestExtract_CommaListAliases(t *testing.T) {
+	r, err := Analyze("SELECT o.id, l.id FROM orders o, lineitem l WHERE o.status = 'x' AND l.linenumber = 1")
+	if err != nil {
+		t.Fatalf("Analyze() unexpected error: %v", err)
+	}
+	if r.TableAliases["o"] != "orders" || r.TableAliases["l"] != "lineitem" {
+		t.Errorf("TableAliases = %v, want o->orders, l->lineitem", r.TableAliases)
+	}
+}
+
 func TestExtract_FetchFirstSuffixNotColumns(t *testing.T) {
 	r, err := Analyze("SELECT id FROM orders WHERE status = 'x' ORDER BY id OFFSET 5 ROWS FETCH FIRST 10 ROWS ONLY")
 	if err != nil {

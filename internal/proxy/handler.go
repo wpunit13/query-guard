@@ -21,11 +21,6 @@ import (
 )
 
 const (
-	// maxStatementBodyBytes caps how much of a statement body we buffer for
-	// inspection. Larger bodies would only be truncated and could produce a
-	// partial parse; guarded statements are still forwarded upstream.
-	maxStatementBodyBytes = 8 << 20 // 8 MiB
-
 	// healthzPath is the liveness endpoint.
 	healthzPath = "/healthz"
 
@@ -175,7 +170,11 @@ func (h *Handler) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	upstream := strings.TrimRight(h.cfg.Get().Upstream.URL, "/")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream+"/v1/info", nil)
+	path := "/v1/info"
+	if h.engine == "clickhouse" {
+		path = "/ping"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream+path, nil)
 	if err != nil {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
@@ -222,8 +221,17 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(ctxlog.WithRequestID(r.Context(), reqID))
 	log := h.logger.With("request_id", reqID)
 
+	maxBody := h.cfg.Get().Server.EffectiveMaxStatementBytes()
+
 	// Read up to max+1 bytes so we can detect a body larger than the cap.
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxStatementBodyBytes+1))
+	// 0 disables the cap (read the whole body, never trigger oversized).
+	var body []byte
+	var err error
+	if maxBody == 0 {
+		body, err = io.ReadAll(r.Body)
+	} else {
+		body, err = io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	}
 	if err != nil {
 		_ = r.Body.Close()
 		// Fail-open: cannot inspect, so forward the query untouched.
@@ -233,21 +241,21 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(body) > maxStatementBodyBytes {
+	if maxBody > 0 && len(body) > int(maxBody) {
 		if h.cfg.Get().Server.OversizedBody == "reject" {
 			// Comment padding past the cap is a known guard-evasion vector.
 			log.Warn("statement body exceeds inspection cap; rejecting (server.oversized_body: reject)",
-				slog.Int("cap_bytes", maxStatementBodyBytes), slog.Int("body_bytes", len(body)))
+				slog.Int64("cap_bytes", maxBody), slog.Int("body_bytes", len(body)))
 			h.record(telemetry.StatusBlocked)
 			h.reject(r, w, ReasonStatementTooLarge,
-				fmt.Sprintf("statement body of %d bytes exceeds the %d byte inspection cap (server.oversized_body: reject)", len(body), maxStatementBodyBytes))
+				fmt.Sprintf("statement body of %d bytes exceeds the %d byte inspection cap (server.oversized_body: reject)", len(body), maxBody))
 			return
 		}
 		// Cannot inspect it: fail open by forwarding the full, un-truncated
 		// request (already-read prefix + remaining body) so the real query is
 		// never corrupted.
 		log.Warn("statement body exceeds inspection cap; forwarding unguarded (fail-open)",
-			slog.Int("cap_bytes", maxStatementBodyBytes),
+			slog.Int64("cap_bytes", maxBody),
 			slog.String("query_excerpt", queryExcerpt(string(body), 200)))
 		h.record(telemetry.StatusBypassed)
 		h.forwardFull(w, r, body)
@@ -343,6 +351,20 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 		allowed, reason, cost, err := h.tier2(r.Context(), r.Header, preflightQuery)
 		switch {
 		case err != nil:
+			if errors.Is(err, engine.ErrPlanTooLarge) {
+				// Plan exceeded its measurement cap. This is a policy signal,
+				// not a measurement failure: plan_too_large decides.
+				if h.cfg.Get().Preflight.PlanTooLarge == "reject" {
+					log.Info("query rejected (plan too large)", slog.String("stage", string(ReasonPlanTooLarge)))
+					h.auditRejection(r, query, ReasonPlanTooLarge, res, &cost)
+					h.record(telemetry.StatusBlocked)
+					h.reject(r, w, ReasonPlanTooLarge,
+						"pre-flight plan exceeds configured size limits (preflight.plan_too_large: reject)")
+					return
+				}
+				// plan_too_large: forward → fail open.
+				break
+			}
 			if failOpen := h.cfg.Get().Preflight.FailOpen; failOpen != nil && !*failOpen {
 				// Fail-closed: the pre-flight could not complete, so the
 				// cost limits cannot be enforced — reject instead of forward.
@@ -477,6 +499,10 @@ func (h *Handler) qualifyBareTables(res *parser.AnalysisResult, r *http.Request)
 			schema = r.URL.Query().Get("database")
 		}
 		if schema == "" {
+			// ClickHouse resolves an unqualified name against the user's
+			// default database. Without an explicit header/param the guard
+			// assumes the ClickHouse default name ("default"); a customized
+			// default_database cannot be observed here (see SECURITY.md).
 			schema = "default"
 		}
 	default:
@@ -492,14 +518,15 @@ func (h *Handler) qualifyBareTables(res *parser.AnalysisResult, r *http.Request)
 // for fail-open log lines where the full statement would be unwieldy.
 func queryExcerpt(query string, max int) string {
 	flat := strings.Join(strings.Fields(query), " ")
-	if len(flat) <= max {
+	r := []rune(flat)
+	if len(r) <= max {
 		return flat
 	}
-	return flat[:max] + "…"
+	return string(r[:max]) + "…"
 }
 
 // requiredFilterMatches reports whether a referenced table matches a required
-// filter entry. Unlike tableMatchesScope, matching is strict: schema.table
+// filter entry. Matching is strict: schema.table
 // must both be present in the reference (catalog too, when set) — no
 // suffix/bare-table breadth. Case-insensitive (Trino unquoted identifiers).
 func requiredFilterMatches(table string, rf config.RequiredFilter) bool {
@@ -560,26 +587,6 @@ func tableBlocklisted(table, entry string) bool {
 		return strings.EqualFold(parts[len(parts)-1], entry)
 	}
 	return false
-}
-
-// tableMatchesScope reports whether a scan table matches a catalog/schema/table
-// scope, matching on the rightmost components (suffix semantics).
-func tableMatchesScope(scanTable, catalog, schema, table string) bool {
-	parts := strings.Split(scanTable, ".")
-	if table != "" && !strings.EqualFold(parts[len(parts)-1], table) {
-		return false
-	}
-	if schema != "" {
-		if len(parts) < 2 || !strings.EqualFold(parts[len(parts)-2], schema) {
-			return false
-		}
-	}
-	if catalog != "" {
-		if len(parts) < 3 || !strings.EqualFold(parts[len(parts)-3], catalog) {
-			return false
-		}
-	}
-	return true
 }
 
 // tableHasFilter reports whether the guarded table is actually filtered on the

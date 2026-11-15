@@ -197,6 +197,10 @@ run_trino() {
   trino_case T-a4 allowed "SELECT c.nationkey FROM tpch.tiny.nation, tpch.tiny.customer c"
   trino_case T-a5 allowed "SELECT name FROM tpch.tiny.nation WHERE nationkey IN (SELECT nationkey FROM tpch.tiny.customer)"
   trino_case T-a6 allowed "SELECT orderkey FROM tpch.tiny.orders WHERE orderdate > DATE '1994-01-01'"
+  # Comma-list FROM with an alias on the second table: the alias must be
+  # resolved so the required filter on orders is satisfied (regression for
+  # the walkTokens comma-list alias gap).
+  trino_case T-a7 allowed "SELECT o.orderkey FROM tpch.tiny.nation n, tpch.tiny.orders o WHERE o.orderdate > DATE '1994-01-01'"
 
   echo " -- red-team: EXPLAIN execution forms --"
   trino_case T-x1 blocked:TABLE_BLOCKLIST     "EXPLAIN ANALYZE SELECT * FROM tpch.tiny.lineitem"

@@ -7,7 +7,7 @@ replicaCount: 2
 image:
   # Default assumes the image is published from this repo's release pipeline
   # (ghcr.io/<owner>/query-guard). Override if you mirror it elsewhere.
-  repository: ghcr.io/your-org/query-guard
+  repository: ghcr.io/wpunit13/query-guard
   pullPolicy: IfNotPresent
   # Overrides the Chart.yaml appVersion if set.
   tag: ""
@@ -47,6 +47,8 @@ policy: |
     read_timeout: 30s
     write_timeout: 5m
     shutdown_grace_period: 10s
+    oversized_body: reject
+    max_statement_bytes: 8388608
 
   upstream:
     # engine selects the guarded database engine: trino (default),
@@ -60,6 +62,10 @@ policy: |
   preflight:
     timeout: 2s
     max_concurrent: 5
+    fail_open: false
+    max_plan_bytes: 1048576
+    max_pages: 64
+    plan_too_large: forward
 
   rules:
     table_blocklist:

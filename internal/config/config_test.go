@@ -475,6 +475,104 @@ rules:
 	}
 }
 
+func TestPlanCaps_DefaultsExplicitAndValidation(t *testing.T) {
+	p := &Policy{}
+	setDefaults(p)
+	if got := p.Server.EffectiveMaxStatementBytes(); got != 8<<20 {
+		t.Errorf("default max_statement_bytes = %d, want %d", got, 8<<20)
+	}
+	if got := p.Preflight.EffectiveMaxPlanBytes(); got != 1<<20 {
+		t.Errorf("default max_plan_bytes = %d, want %d", got, 1<<20)
+	}
+	if got := p.Preflight.EffectiveMaxPages(); got != 64 {
+		t.Errorf("default max_pages = %d, want 64", got)
+	}
+	if p.Preflight.PlanTooLarge != "forward" {
+		t.Errorf("default plan_too_large = %q, want forward", p.Preflight.PlanTooLarge)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	writeFile(t, path, `
+upstream:
+  url: "http://trino:8080"
+
+server:
+  max_statement_bytes: 0
+
+preflight:
+  max_plan_bytes: 0
+  max_pages: 0
+  plan_too_large: reject
+
+rules:
+  table_blocklist: [t]
+`)
+	p2, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if got := p2.Server.EffectiveMaxStatementBytes(); got != 0 {
+		t.Errorf("explicit max_statement_bytes 0 = %d, want 0 (no cap)", got)
+	}
+	if got := p2.Preflight.EffectiveMaxPlanBytes(); got != 0 {
+		t.Errorf("explicit max_plan_bytes 0 = %d, want 0 (unlimited)", got)
+	}
+	if got := p2.Preflight.EffectiveMaxPages(); got != 0 {
+		t.Errorf("explicit max_pages 0 = %d, want 0 (unlimited)", got)
+	}
+	if p2.Preflight.PlanTooLarge != "reject" {
+		t.Errorf("plan_too_large = %q, want reject", p2.Preflight.PlanTooLarge)
+	}
+}
+
+func TestPlanCaps_Validation(t *testing.T) {
+	cases := map[string]string{
+		"negative max_statement_bytes": `
+server:
+  max_statement_bytes: -1
+upstream:
+  url: "http://trino:8080"
+rules:
+  table_blocklist: [t]
+`,
+		"negative max_plan_bytes": `
+preflight:
+  max_plan_bytes: -1
+upstream:
+  url: "http://trino:8080"
+rules:
+  table_blocklist: [t]
+`,
+		"negative max_pages": `
+preflight:
+  max_pages: -1
+upstream:
+  url: "http://trino:8080"
+rules:
+  table_blocklist: [t]
+`,
+		"bad plan_too_large": `
+preflight:
+  plan_too_large: drop
+upstream:
+  url: "http://trino:8080"
+rules:
+  table_blocklist: [t]
+`,
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "policy.yaml")
+			writeFile(t, path, yaml)
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected validation error for %s, got nil", name)
+			}
+		})
+	}
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // YAML Helpers
 // ──────────────────────────────────────────────────────────────────────────────
