@@ -1,0 +1,89 @@
+# Policy for the ClickHouse Docker Compose harness. The upstream points at the
+# ClickHouse container by its compose service name on the shared network.
+# ClickHouse Tier 2 is ROWS-ONLY: EXPLAIN ESTIMATE has no scan-byte or CPU
+# estimate, so only max_rows limits are enforced.
+server:
+  port: 8090
+  read_timeout: 30s
+  write_timeout: 5m
+  shutdown_grace_period: 10s
+
+upstream:
+  engine: clickhouse
+  url: http://clickhouse:8123
+  timeout: 30s
+
+preflight:
+  timeout: 2s
+  max_concurrent: 5
+  # Reject read queries whose plan yields no per-table estimates while they
+  # reference tables (views, table functions): the rows limits would
+  # otherwise be silently inert for those shapes.
+  require_estimates: true
+
+rules:
+  table_blocklist:
+    - secret_data
+
+  # Table-valued functions read rows without naming a physical table, so the
+  # table blocklist cannot see through them. Deny the data-access and
+  # unbounded-scan functions explicitly.
+  table_function_blocklist:
+    - merge
+    - remote
+    - remoteSecure
+    - cluster
+    - clusterAllReplicas
+    - clusterAllReplicasSecure
+    - url
+    - urlWithGlobs
+    - s3
+    - s3WithGlobs
+    - hdfs
+    - hdfsCluster
+    - file
+    - fileCluster
+    - jdbc
+    - odbc
+    - mysql
+    - mysql8
+    - postgresql
+    - mongodb
+    - redis
+    - dictionary
+    - executable
+    - executableCluster
+    - input
+    - generateRandom
+    - generateRandomWithSeed
+    - generateRandomStructure
+    - numbers
+    - numbers_mt
+    - zeros
+    - zeros_mt
+
+  # SYSTEM (SHUTDOWN, DROP CACHE, RELOAD CONFIG, ...) and KILL are
+  # administration statements, not read-only bypasses.
+  statement_blocklist:
+    - SYSTEM
+    - KILL
+
+  required_filters:
+    - schema: default
+      table: events
+      mode: any-of
+      columns: [event_date]
+
+  # Rows-only: ClickHouse EXPLAIN ESTIMATE carries no byte/CPU estimates.
+  cost_limits:
+    - schema: default
+      table: hits
+      max_rows: 1000
+
+audit:
+  log_rejections: true
+  snapshot_plan: true
+
+telemetry:
+  enabled: true
+  path: /metrics

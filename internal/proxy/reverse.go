@@ -18,10 +18,6 @@ import (
 // Reverse Proxy — upstream database forwarding
 // ──────────────────────────────────────────────────────────────────────────────
 
-// statementPath is the engine coordinator endpoint that accepts queries. The
-// handler intercepts POST requests to this path for Tier 1/2 evaluation.
-const statementPath = "/v1/statement"
-
 // clientHostKey is the context key under which the original client-facing Host
 // is stored before the Director rewrites req.Host to the upstream target.
 type clientHostKey struct{}

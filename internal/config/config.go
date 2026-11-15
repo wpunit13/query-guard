@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +48,10 @@ type ServerConfig struct {
 	WriteTimeout  time.Duration `yaml:"write_timeout"`
 	ShutdownGrace time.Duration `yaml:"shutdown_grace_period"`
 	TLS           TLSConfig     `yaml:"tls"`
+	// OversizedBody: "forward" (default, fail-open) or "reject"
+	// (fail-closed, 400 STATEMENT_TOO_LARGE) for bodies past the 8 MiB
+	// inspection cap. Comment padding past the cap is a guard-evasion vector.
+	OversizedBody string `yaml:"oversized_body"`
 }
 
 // TLSConfig configures native HTTPS on the proxy listener. When CertFile and
@@ -63,6 +69,10 @@ func (t TLSConfig) Enabled() bool { return t.CertFile != "" && t.KeyFile != "" }
 
 // UpstreamConfig defines the target database cluster to proxy to.
 type UpstreamConfig struct {
+	// Engine selects which database engine sits behind the upstream URL
+	// ("trino", "clickhouse", "cockroachdb", "snowflake"). One guard process
+	// serves exactly one engine; empty defaults to trino.
+	Engine  string        `yaml:"engine"`
 	URL     string        `yaml:"url"`
 	Timeout time.Duration `yaml:"timeout"`
 }
@@ -71,6 +81,14 @@ type UpstreamConfig struct {
 type PreflightConfig struct {
 	Timeout       time.Duration `yaml:"timeout"`
 	MaxConcurrent int           `yaml:"max_concurrent"`
+	// FailOpen: true (default) forwards the query unguarded when the
+	// pre-flight itself cannot complete (timeout, upstream error, gate
+	// saturation); false rejects it instead (fail-closed).
+	FailOpen *bool `yaml:"fail_open"`
+	// RequireEstimates rejects read queries whose pre-flight plan yields no
+	// per-table estimates while the statement references tables (views,
+	// table functions, engines without statistics). Default false.
+	RequireEstimates bool `yaml:"require_estimates"`
 }
 
 // RulesConfig contains all static and cost-based enforcement rules.
@@ -82,6 +100,11 @@ type RulesConfig struct {
 	// FunctionBlocklist lists function/UDF names (case-insensitive) that may
 	// not appear anywhere in a statement. Empty = disabled.
 	FunctionBlocklist []string `yaml:"function_blocklist"`
+	// TableFunctionBlocklist lists table-valued function names (merge,
+	// remote, s3, ...) that may not appear in FROM/JOIN position. A table
+	// function reads rows without naming a physical table, so
+	// table_blocklist cannot see through it. Empty = disabled.
+	TableFunctionBlocklist []string `yaml:"table_function_blocklist"`
 	// SelectStarBlockedTables lists tables on which `SELECT *` is rejected
 	// (case-insensitive; explicit column lists are fine). Empty = disabled.
 	SelectStarBlockedTables []string `yaml:"select_star_blocked_tables"`
@@ -201,6 +224,9 @@ func setDefaults(p *Policy) {
 	if p.Upstream.Timeout == 0 {
 		p.Upstream.Timeout = 30 * time.Second
 	}
+	if p.Upstream.Engine == "" {
+		p.Upstream.Engine = "trino"
+	}
 	if p.Preflight.Timeout == 0 {
 		p.Preflight.Timeout = 2 * time.Second
 	}
@@ -210,7 +236,18 @@ func setDefaults(p *Policy) {
 	if p.Telemetry.Path == "" {
 		p.Telemetry.Path = "/metrics"
 	}
+	if p.Server.OversizedBody == "" {
+		p.Server.OversizedBody = "forward"
+	}
+	if p.Preflight.FailOpen == nil {
+		t := true
+		p.Preflight.FailOpen = &t
+	}
 }
+
+// supportedEngines lists the engines upstream.engine may select. Spark and
+// Hive are explicitly out of scope.
+var supportedEngines = []string{"trino", "clickhouse", "cockroachdb", "snowflake"}
 
 // Validate checks that required fields are present and rules are coherent.
 func (p *Policy) Validate() error {
@@ -219,6 +256,12 @@ func (p *Policy) Validate() error {
 	}
 	if p.Upstream.URL == "" {
 		return fmt.Errorf("upstream.url must not be empty")
+	}
+	// setDefaults fills an empty engine with "trino", so validation only ever
+	// sees an explicitly configured (or defaulted) value here.
+	if !slices.Contains(supportedEngines, p.Upstream.Engine) {
+		return fmt.Errorf("upstream.engine must be one of [%s], got %q",
+			strings.Join(supportedEngines, ", "), p.Upstream.Engine)
 	}
 	if len(p.Rules.CostLimits) == 0 &&
 		len(p.Rules.TableBlocklist) == 0 &&
@@ -273,6 +316,13 @@ func (p *Policy) Validate() error {
 	}
 	if tlsSet == 1 {
 		return fmt.Errorf("server.tls: both cert_file and key_file must be set to enable TLS (got only one)")
+	}
+
+	switch p.Server.OversizedBody {
+	case "", "forward", "reject":
+		// valid (empty is filled by setDefaults)
+	default:
+		return fmt.Errorf("server.oversized_body must be \"forward\" or \"reject\", got %q", p.Server.OversizedBody)
 	}
 	return nil
 }

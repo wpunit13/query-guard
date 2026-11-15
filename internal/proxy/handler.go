@@ -34,20 +34,28 @@ const (
 
 	// defaultMetricsPath is used when TelemetryConfig.Path is empty.
 	defaultMetricsPath = "/metrics"
+
+	// defaultStatementPath is the fallback guarded endpoint used when no
+	// evaluator is configured (Tier-1-only mode). Configured engines override
+	// it via Engine.StatementPath.
+	defaultStatementPath = "/v1/statement"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Handler — primary HTTP handler
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Handler intercepts `POST /v1/statement`, runs Tier 1 (static AST) and Tier 2
-// (pre-flight cost) checks, and proxies approved or bypassed requests upstream.
-// It also serves the `GET /healthz` liveness probe and (when enabled) the
-// Prometheus metrics endpoint. Everything else is proxied directly, so
-// metadata/utility endpoints and engine protocol calls pass through untouched.
+// Handler intercepts `POST <engine.StatementPath()>`, runs Tier 1 (static
+// AST) and Tier 2 (pre-flight cost) checks, and proxies approved or bypassed
+// requests upstream. It depends only on the engine.Engine and parser.Dialect
+// interfaces, never on a concrete engine. It also serves the `GET /healthz`
+// liveness probe and (when enabled) the Prometheus metrics endpoint. Everything
+// else is proxied directly, so metadata/utility endpoints and engine protocol
+// calls pass through untouched.
 type Handler struct {
 	cfg       *config.Config
-	evaluator engine.CostEvaluator
+	evaluator engine.Engine
+	dialect   parser.Dialect
 	proxy     atomic.Pointer[httputil.ReverseProxy]
 	logger    *slog.Logger
 	metrics   *telemetry.Metrics
@@ -57,7 +65,7 @@ type Handler struct {
 // NewHandler builds a Handler. evaluator may be nil, in which case Tier 2 is
 // skipped and only Tier 1 static checks apply (fail-open). A nil logger falls
 // back to slog.Default(). Telemetry is attached separately via SetMetrics.
-func NewHandler(cfg *config.Config, evaluator engine.CostEvaluator, logger *slog.Logger) (*Handler, error) {
+func NewHandler(cfg *config.Config, evaluator engine.Engine, logger *slog.Logger) (*Handler, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -76,6 +84,7 @@ func NewHandler(cfg *config.Config, evaluator engine.CostEvaluator, logger *slog
 	h := &Handler{
 		cfg:       cfg,
 		evaluator: evaluator,
+		dialect:   parser.For(engineName),
 		logger:    logger,
 		engine:    engineName,
 	}
@@ -107,9 +116,19 @@ func (h *Handler) SetMetrics(m *telemetry.Metrics) {
 	h.metrics = m
 }
 
+// statementPath returns the guarded endpoint for the configured engine. With
+// no evaluator (Tier-1-only mode) it falls back to the Trino-style default so
+// static checks still apply.
+func (h *Handler) statementPath() string {
+	if h.evaluator == nil {
+		return defaultStatementPath
+	}
+	return h.evaluator.StatementPath()
+}
+
 // ServeHTTP routes requests. Health and metrics endpoints are served locally;
-// `POST /v1/statement` is evaluated; all other paths (bypass endpoints such as
-// /v1/info, engine protocol calls) are proxied directly.
+// `POST <statementPath>` is evaluated; all other paths (bypass endpoints such
+// as /v1/info, engine protocol calls) are proxied directly.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == healthzPath:
@@ -124,7 +143,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.metrics.Handler().ServeHTTP(w, r)
 		return
 
-	case r.Method == http.MethodPost && r.URL.Path == statementPath:
+	case r.Method == http.MethodPost && r.URL.Path == h.statementPath():
+		h.handleStatement(w, r)
+		return
+
+	case r.Method == http.MethodGet && r.URL.Path == h.statementPath() && r.URL.Query().Get("query") != "":
+		// ClickHouse accepts statements in the ?query= parameter on GET too.
 		h.handleStatement(w, r)
 		return
 
@@ -210,32 +234,64 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(body) > maxStatementBodyBytes {
-		// Oversized body: we cannot safely inspect it. Fail open by forwarding
-		// the full, un-truncated request (already-read prefix + remaining body)
-		// so the real query is never corrupted.
-		log.Warn("statement body exceeds inspection cap; forwarding unguarded (fail-open)", slog.Int("cap_bytes", maxStatementBodyBytes))
+		if h.cfg.Get().Server.OversizedBody == "reject" {
+			// Comment padding past the cap is a known guard-evasion vector.
+			log.Warn("statement body exceeds inspection cap; rejecting (server.oversized_body: reject)",
+				slog.Int("cap_bytes", maxStatementBodyBytes), slog.Int("body_bytes", len(body)))
+			h.record(telemetry.StatusBlocked)
+			h.reject(r, w, ReasonStatementTooLarge,
+				fmt.Sprintf("statement body of %d bytes exceeds the %d byte inspection cap (server.oversized_body: reject)", len(body), maxStatementBodyBytes))
+			return
+		}
+		// Cannot inspect it: fail open by forwarding the full, un-truncated
+		// request (already-read prefix + remaining body) so the real query is
+		// never corrupted.
+		log.Warn("statement body exceeds inspection cap; forwarding unguarded (fail-open)",
+			slog.Int("cap_bytes", maxStatementBodyBytes),
+			slog.String("query_excerpt", queryExcerpt(string(body), 200)))
 		h.record(telemetry.StatusBypassed)
 		h.forwardFull(w, r, body)
 		return
 	}
 	_ = r.Body.Close()
 
-	query := strings.TrimSpace(string(body))
-	if query == "" {
-		// Nothing to evaluate; forward the empty statement to the engine.
+	// The statement can arrive in the body or in the ?query= URL parameter
+	// (ClickHouse accepts both; GET requests carry only the parameter).
+	// Whichever holds it goes through the pipeline below; the request itself
+	// is forwarded unchanged.
+	query := strings.TrimSpace(r.URL.Query().Get("query"))
+	bodyStmt := strings.TrimSpace(string(body))
+	if query == "" && bodyStmt == "" {
 		h.record(telemetry.StatusBypassed)
 		h.forward(w, r, body)
 		return
 	}
+	if query != "" && bodyStmt != "" {
+		// Parameter holds the statement, body holds accompanying data
+		// (ClickHouse INSERT ... FORMAT <fmt> sends row data this way). The
+		// engine does not execute the body as SQL, but blocklists still scan
+		// it so nothing rides along uninspected.
+		if res, err := h.dialect.Analyze(bodyStmt); err == nil {
+			if reason, msg, allow := h.tier1(res); !allow {
+				log.Info("query rejected by tier 1 (request body)",
+					slog.String("stage", string(reason)), slog.String("statement_class", res.StatementClass.String()))
+				h.auditRejection(r, bodyStmt, reason, res, nil)
+				h.record(telemetry.StatusBlocked)
+				h.reject(r, w, reason, msg)
+				return
+			}
+		}
+	}
+	if query == "" {
+		query = bodyStmt
+	}
 
-	// Normalise the statement for analysis and pre-flight. Clients such as
-	// DBeaver's Trino driver append a trailing semicolon, which would make the
-	// shadow `EXPLAIN ...;` invalid and cause the pre-flight to fail open. Strip
-	// trailing semicolons and whitespace so the guard actually evaluates the
-	// query. The original body is still forwarded upstream unchanged.
+	// Clients such as DBeaver's Trino driver append a trailing semicolon, which
+	// would make the shadow `EXPLAIN ...;` invalid and fail the pre-flight
+	// open. The original body is still forwarded upstream unchanged.
 	query = strings.TrimRight(query, "; \t\n\r")
 
-	res, err := parser.Analyze(query)
+	res, err := h.dialect.Analyze(query)
 	if err != nil {
 		// Fail-open: parser error forwards the original query.
 		log.Error("parser analyze error; forwarding (fail-open)", slog.String("error", err.Error()))
@@ -245,8 +301,26 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Qualify bare table references with the request's catalog/schema context
+	// so required-filter scoping cannot be evaded by omitting the qualifier
+	// (engines resolve bare names against the session catalog/schema or the
+	// default database).
+	h.qualifyBareTables(res, r)
+
+	// Executing EXPLAIN forms (EXPLAIN ANALYZE / TYPE EXECUTE) run their inner
+	// statement: they must not bypass Tier 1, and Tier 2 must pre-flight the
+	// inner query rather than the wrapper.
+	isExecExplain := false
+	preflightQuery := query
+	if res.StatementClass == parser.StatementExplain {
+		if inner, ok := parser.SplitExecutingExplain(query); ok {
+			isExecExplain = true
+			preflightQuery = inner
+		}
+	}
+
 	// Bypass statements (SHOW, DESCRIBE, EXPLAIN, USE, SET) skip both tiers.
-	if parser.IsBypass(res.StatementClass) {
+	if parser.IsBypass(res.StatementClass) && !isExecExplain {
 		h.record(telemetry.StatusBypassed)
 		h.forward(w, r, body)
 		return
@@ -263,11 +337,24 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Tier 2: pre-flight cost evaluation for read queries with cost limits.
-	if h.shouldPreflight(res.StatementClass) {
-		allowed, reason, cost, err := h.tier2(r.Context(), r.Header, query)
-		if err != nil {
+	// Executing EXPLAIN forms are pre-flighted on their inner statement so
+	// cost limits apply to the query that actually runs.
+	if h.shouldPreflight(res.StatementClass) || isExecExplain {
+		allowed, reason, cost, err := h.tier2(r.Context(), r.Header, preflightQuery)
+		switch {
+		case err != nil:
+			if failOpen := h.cfg.Get().Preflight.FailOpen; failOpen != nil && !*failOpen {
+				// Fail-closed: the pre-flight could not complete, so the
+				// cost limits cannot be enforced — reject instead of forward.
+				log.Info("query rejected by tier 2 (fail-closed)", slog.String("stage", string(ReasonPreflightFailed)))
+				h.auditRejection(r, query, ReasonPreflightFailed, res, &cost)
+				h.record(telemetry.StatusBlocked)
+				h.reject(r, w, ReasonPreflightFailed,
+					"pre-flight evaluation could not complete and preflight.fail_open is false")
+				return
+			}
 			// Fail-open: evaluation could not complete; forward the query.
-		} else if !allowed {
+		case !allowed:
 			// Definitive limit breach → reject. (Blocked bytes were attributed
 			// to the telemetry counter inside tier2.)
 			log.Info("query rejected by tier 2",
@@ -275,6 +362,16 @@ func (h *Handler) handleStatement(w http.ResponseWriter, r *http.Request) {
 			h.auditRejection(r, query, ReasonCostLimitBreach, res, &cost)
 			h.record(telemetry.StatusBlocked)
 			h.reject(r, w, ReasonCostLimitBreach, reason)
+			return
+		case h.cfg.Get().Preflight.RequireEstimates && len(res.Tables) > 0 && len(cost.TableScans) == 0:
+			// The statement references tables but the plan carries no per-table
+			// estimates (views, table functions, missing statistics): the
+			// table-scoped limits are inert. Fail closed when configured.
+			log.Info("query rejected by tier 2 (no table estimates)", slog.String("stage", string(ReasonPreflightNoEstimates)))
+			h.auditRejection(r, query, ReasonPreflightNoEstimates, res, &cost)
+			h.record(telemetry.StatusBlocked)
+			h.reject(r, w, ReasonPreflightNoEstimates,
+				"plan carries no per-table estimates for referenced tables and preflight.require_estimates is true")
 			return
 		}
 	}
@@ -310,11 +407,23 @@ func (h *Handler) tier1(res *parser.AnalysisResult) (RejectionReason, string, bo
 	}
 
 	// Function blocklist (Feature B): any blocked function appearing in the
-	// projections or WHERE/ON clauses (including CTEs/subqueries) is rejected.
+	// projections or WHERE/ON clauses (including CTEs and predicate
+	// subqueries) is rejected.
 	for _, fn := range res.Functions {
 		for _, blocked := range p.Rules.FunctionBlocklist {
 			if strings.EqualFold(fn, blocked) {
 				return ReasonFunctionBlocklist, fmt.Sprintf("function %q is blocked by policy", fn), false
+			}
+		}
+	}
+
+	// Table-function blocklist: a table-valued function reads rows without
+	// naming a physical table (merge('db','regex'), remote('host', db, table)),
+	// so table_blocklist cannot see through it.
+	for _, fn := range res.TableFunctions {
+		for _, blocked := range p.Rules.TableFunctionBlocklist {
+			if strings.EqualFold(fn, blocked) {
+				return ReasonTableFunctionBlocklist, fmt.Sprintf("table function %q is blocked by policy", fn), false
 			}
 		}
 	}
@@ -349,6 +458,44 @@ func (h *Handler) tier1(res *parser.AnalysisResult) (RejectionReason, string, bo
 	}
 
 	return ReasonTableBlocklist, "", true
+}
+
+// qualifyBareTables prefixes bare (single-component) table references with
+// the request's catalog/schema context so required-filter scoping cannot be
+// evaded by omitting the qualifier. Trino resolves bare names against the
+// X-Trino-Catalog / X-Trino-Schema session headers; ClickHouse against the
+// X-ClickHouse-Database header, the ?database= URL parameter, or "default".
+func (h *Handler) qualifyBareTables(res *parser.AnalysisResult, r *http.Request) {
+	var catalog, schema string
+	switch h.engine {
+	case "trino":
+		catalog = r.Header.Get("X-Trino-Catalog")
+		schema = r.Header.Get("X-Trino-Schema")
+	case "clickhouse":
+		schema = r.Header.Get("X-ClickHouse-Database")
+		if schema == "" {
+			schema = r.URL.Query().Get("database")
+		}
+		if schema == "" {
+			schema = "default"
+		}
+	default:
+		return
+	}
+	if catalog == "" && schema == "" {
+		return
+	}
+	res.Tables = parser.QualifyBareTables(res.Tables, catalog, schema)
+}
+
+// queryExcerpt returns the first max runes of a query with newlines collapsed,
+// for fail-open log lines where the full statement would be unwieldy.
+func queryExcerpt(query string, max int) string {
+	flat := strings.Join(strings.Fields(query), " ")
+	if len(flat) <= max {
+		return flat
+	}
+	return flat[:max] + "…"
 }
 
 // requiredFilterMatches reports whether a referenced table matches a required
@@ -498,10 +645,12 @@ func (h *Handler) tier2(ctx context.Context, headers http.Header, query string) 
 			h.metricsPreflightRejected()
 		}
 		// Fail-open: log and forward. The engine logs the error with the
-		// request ID from ctx; record the stage here too.
+		// request ID from ctx; record the stage here too, with a query excerpt
+		// so fail-open forwards are attributable in the logs.
 		h.logger.Error("pre-flight evaluation error (fail-open)",
 			slog.String("request_id", ctxlog.FromContext(ctx)),
-			slog.String("error", err.Error()))
+			slog.String("error", err.Error()),
+			slog.String("query_excerpt", queryExcerpt(query, 200)))
 		return false, "", cost, err
 	}
 

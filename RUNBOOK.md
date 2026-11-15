@@ -8,15 +8,49 @@ architecture see `README.md`; for the backlog see `NEXT_TASKS.md`.
 
 ## Core operating principle
 
-**query-guard fails open.** By design (blueprint principle #3), a safety tool
-must never cause platform downtime: parser errors, pre-flight timeouts,
-concurrency-gate saturation, and oversized bodies all result in the original
-query being **forwarded unguarded**. Consequences for operations:
+**query-guard fails open by default.** By design (blueprint principle #3), a
+safety tool must never cause platform downtime: parser errors, pre-flight
+timeouts, concurrency-gate saturation, and oversized bodies all result in the
+original query being **forwarded unguarded**. Consequences for operations:
 
 - The guard failing does not page you about user-visible errors — you must
   watch its metrics (below) to know it is degraded.
 - Silence is not health. A guard that rejects nothing may be broken, not
   peaceful.
+
+### Fail-closed opt-outs
+
+Each fail-open path has a policy switch that turns it into a rejection for
+policies where enforcement is mandatory. All default to the historical
+fail-open behavior — nothing below fires unless configured:
+
+| Fail-open path | Switch | Opt-in behavior |
+|---|---|---|
+| Pre-flight timeout / upstream error / gate saturation | `preflight.fail_open: false` | Query rejected `PREFLIGHT_FAILED` instead of forwarded |
+| Body over the 8 MiB inspection cap | `server.oversized_body: reject` | Query rejected `STATEMENT_TOO_LARGE` instead of forwarded |
+| Plan without per-table estimates (views, table functions, aggregate-only plans such as `count(*)`) | `preflight.require_estimates: true` | Query rejected `PREFLIGHT_NO_ESTIMATES` instead of silently unenforced |
+
+Parser errors (dialect gaps) remain fail-open with no switch — a guard that
+cannot parse cannot safely reject either. Every fail-open forward is logged at
+ERROR with a `query_excerpt` of the statement, so bypass attempts are
+attributable from the logs.
+
+## Engines & Tier 2 coverage
+
+One guard process serves exactly one engine, selected by `upstream.engine`
+(`trino` default, `clickhouse`, `cockroachdb`, `snowflake`). Deploy one guard
+instance per engine.
+
+**ClickHouse is rows-only in Tier 2.** `EXPLAIN ESTIMATE` reports per-table
+row estimates only — there is no scan-byte or CPU estimate — so only
+`max_rows` limits are enforced; `max_scan_bytes` / `max_cpu_cost_per_query`
+are silently inert for ClickHouse (the same inert-limit pattern as
+`queryguard_preflight_no_table_estimates_total` for Trino). Tier 1 (blocklists,
+required filters, `SELECT *`, function blocklist) works identically.
+
+Note: `/readyz` probes the upstream's `/v1/info`, a Trino protocol endpoint.
+Against ClickHouse it reports not-ready (503) by design — monitor `/healthz`
+and the upstream's own `/ping` instead.
 
 ## Rejection reasons
 
@@ -24,7 +58,12 @@ The JSON 400 body's `reason` field identifies the enforcing rule:
 `TABLE_BLOCKLIST`, `REQUIRED_FILTER_MISSING` (any-of/all-of required
 filters), `STATEMENT_BLOCKLIST`, `COST_LIMIT_BREACH` (scan bytes, rows, or
 CPU cost), `FUNCTION_BLOCKLIST` (blocked function/UDF), `SELECT_STAR_BLOCKED`
-(`SELECT *` on a restricted table).
+(`SELECT *` on a restricted table), `TABLE_FUNCTION_BLOCKLIST` (table-valued
+function listed in `rules.table_function_blocklist`), `STATEMENT_TOO_LARGE`
+(`server.oversized_body: reject`), `PREFLIGHT_FAILED`
+(`preflight.fail_open: false`), and `PREFLIGHT_NO_ESTIMATES`
+(`preflight.require_estimates: true`). The last four are fail-closed opt-outs
+(see above) and never fire on a stock policy.
 
 ## Metrics reference
 
@@ -33,7 +72,7 @@ All metrics are exported at `GET /metrics` (path configurable via
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `queryguard_queries_total{status,engine}` | counter | Queries handled, tagged `allowed` / `blocked` / `bypassed`. `bypassed` includes both intentional bypasses (SHOW/DESCRIBE/EXPLAIN/USE/SET) and fail-open forwards. |
+| `queryguard_queries_total{status,engine}` | counter | Queries handled, tagged `allowed` / `blocked` / `bypassed`. `bypassed` includes both intentional bypasses (SHOW/DESCRIBE/EXPLAIN/USE/SET) and fail-open forwards. Executing EXPLAIN forms (`EXPLAIN ANALYZE`, `TYPE EXECUTE`) are NOT bypasses — they are evaluated like ordinary statements. |
 | `queryguard_blocked_bytes_total` | counter | Estimated scan bytes attributed to rejected queries (volume of runaway work prevented). |
 | `queryguard_preflight_duration_seconds` | histogram | Tier 2 `EXPLAIN (TYPE IO)` round-trip duration. Watch P99 — this is the latency tax every SELECT pays. |
 | `queryguard_parser_errors_total` | counter | SQL statements the parser could not analyze — **these were forwarded unguarded**. |
@@ -50,7 +89,8 @@ after the pilot week):
 - **Meaning:** SQL dialect gaps or malformed queries. Every increment is a
   query the guard evaluated *not at all*. Sustained growth can indicate a
   deliberate bypass attempt.
-- **Action:** Find the offending query (see Correlation below), add it to a
+- **Action:** The fail-open log line carries a `query_excerpt` of the
+  statement — grep for `fail-open` with the request ID. Add the shape to a
   parser test case, and assess whether the dialect gap needs a fix or an
   explicit bypass-list entry.
 
@@ -66,12 +106,14 @@ after the pilot week):
 
 ### 3. Table-scoped limits inert — `queryguard_preflight_no_table_estimates_total`
 - **Alert:** `increase(queryguard_preflight_no_table_estimates_total[1h]) > 0`
-- **Meaning:** Plans lacking per-table estimates (aggregate-only plans,
-  fallback paths). Table-scoped `max_scan_bytes`/`max_rows` were not enforced
-  for those queries; only the global per-query limit applied.
+- **Meaning:** Plans lacking per-table estimates (aggregate-only plans such as
+  `count(*)`, views, table functions, fallback paths). Table-scoped
+  `max_scan_bytes`/`max_rows` were not enforced for those queries; only the
+  global per-query limit applied.
 - **Action:** Identify the query shape (Correlation below). If it is a common
-  pattern, either add a global per-query limit that covers it or raise a bug
-  with the plan-parse path.
+  pattern, either add a global per-query limit that covers it, set
+  `preflight.require_estimates: true` to reject such queries outright, or
+  raise a bug with the plan-parse path.
 
 ### 4. Guard unreachable / readiness failing
 - **Alert:** `probe_success{job="query-guard"} == 0` or `/readyz` returning 503
@@ -182,6 +224,10 @@ first thing to check.
 4. If neither is growing and queries are still unguarded, check whether cost
    limits are actually configured — no `cost_limits` means Tier 2 never runs
    (by design; Tier 1 still applies).
+5. Mitigation: if the fail-open path is a pre-flight failure and the policy
+   can tolerate rejecting instead, set `preflight.fail_open: false` (and
+   `server.oversized_body: reject` for oversized bodies). Verify with
+   `scripts/redteam-verify.sh` against a canary before rolling out.
 
 ### Upstream URL change (coordinator migration)
 Update `upstream.url` in the mounted policy — the watcher hot-reloads and the

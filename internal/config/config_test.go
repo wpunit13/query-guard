@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,6 +112,64 @@ func TestDefaults_Applied(t *testing.T) {
 	}
 	if p.Upstream.Timeout != 30*time.Second {
 		t.Errorf("expected default upstream timeout 30s, got %v", p.Upstream.Timeout)
+	}
+}
+
+// TestRedTeamFix_DefaultsAreNonBlocking pins the defaults of the red-team-fix
+// options: every new rejection reason (STATEMENT_TOO_LARGE, PREFLIGHT_FAILED,
+// PREFLIGHT_NO_ESTIMATES, TABLE_FUNCTION_BLOCKLIST) is OFF unless the policy
+// explicitly opts in, so upgrading never introduces new blocks.
+func TestRedTeamFix_DefaultsAreNonBlocking(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	writeFile(t, path, minimalValidYAML())
+
+	p, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	if p.Server.OversizedBody != "forward" {
+		t.Errorf("default server.oversized_body = %q, want \"forward\" (STATEMENT_TOO_LARGE off)", p.Server.OversizedBody)
+	}
+	if p.Preflight.FailOpen == nil || !*p.Preflight.FailOpen {
+		t.Errorf("default preflight.fail_open = %v, want true (PREFLIGHT_FAILED off)", p.Preflight.FailOpen)
+	}
+	if p.Preflight.RequireEstimates {
+		t.Error("default preflight.require_estimates = true, want false (PREFLIGHT_NO_ESTIMATES off)")
+	}
+	if len(p.Rules.TableFunctionBlocklist) != 0 {
+		t.Errorf("default rules.table_function_blocklist = %v, want empty (TABLE_FUNCTION_BLOCKLIST off)", p.Rules.TableFunctionBlocklist)
+	}
+}
+
+func TestRedTeamFix_OversizedBodyValidation(t *testing.T) {
+	cases := map[string]bool{
+		"forward": true, "reject": true, "": true,
+		"block": false, "REJECT": false, "drop": false,
+	}
+	for value, wantOK := range cases {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "policy.yaml")
+		writeFile(t, path, fmt.Sprintf(`
+server:
+  port: 8080
+  oversized_body: %q
+
+upstream:
+  url: "http://trino:8080"
+
+rules:
+  table_blocklist:
+    - lineitem
+`, value))
+		_, err := Load(path)
+		if wantOK && err != nil {
+			t.Errorf("oversized_body %q: unexpected error %v", value, err)
+		}
+		if !wantOK && err == nil {
+			t.Errorf("oversized_body %q: expected validation error, got nil", value)
+		}
 	}
 }
 
@@ -347,6 +406,72 @@ func TestConfig_GetAndSet(t *testing.T) {
 	// Original pointer must not be mutated
 	if p1.Server.Port != 8080 {
 		t.Errorf("original policy was mutated; port changed to %d", p1.Server.Port)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Multi-Engine Config Tests (upstream.engine selector)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestUpstreamEngine_DefaultsToTrino(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	writeFile(t, path, minimalValidYAML()) // no engine key
+
+	p, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if p.Upstream.Engine != "trino" {
+		t.Errorf("expected default upstream.engine trino, got %q", p.Upstream.Engine)
+	}
+}
+
+func TestUpstreamEngine_AcceptsKnownEngines(t *testing.T) {
+	for _, engine := range []string{"trino", "clickhouse", "cockroachdb", "snowflake"} {
+		t.Run(engine, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "policy.yaml")
+			writeFile(t, path, fmt.Sprintf(`
+upstream:
+  url: "http://upstream:8080"
+  engine: %s
+
+rules:
+  statement_blocklist: ["ALTER"]
+`, engine))
+
+			p, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%q) unexpected error: %v", engine, err)
+			}
+			if p.Upstream.Engine != engine {
+				t.Errorf("upstream.engine = %q, want %q", p.Upstream.Engine, engine)
+			}
+		})
+	}
+}
+
+func TestUpstreamEngine_RejectsUnknownEngines(t *testing.T) {
+	// Spark and Hive are out of scope forever; anything unlisted must fail
+	// loudly at load time rather than silently degrading.
+	for _, engine := range []string{"spark", "hive", "mysql", "Trino"} {
+		t.Run(engine, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "policy.yaml")
+			writeFile(t, path, fmt.Sprintf(`
+upstream:
+  url: "http://upstream:8080"
+  engine: %s
+
+rules:
+  statement_blocklist: ["ALTER"]
+`, engine))
+
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected validation error for engine %q, got nil", engine)
+			}
+		})
 	}
 }
 

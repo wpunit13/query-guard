@@ -23,9 +23,8 @@ func TestAnalyze_ErrUnsupported(t *testing.T) {
 }
 
 func TestAnalyze_SelectThreePartQualifier(t *testing.T) {
-	// Three-part names (catalog.schema.table) are Trino syntax.
-	// vitess MySQL parser rejects them, but the raw scanner extracts
-	// the table name directly from the original SQL.
+	// Three-part names (catalog.schema.table) are Trino syntax; the raw
+	// scanner extracts the table name directly from the original SQL.
 	r, err := Analyze("SELECT * FROM hive.default.orders")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

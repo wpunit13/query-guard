@@ -8,6 +8,16 @@ server:
 upstream:
   url: http://localhost:8082
   timeout: 30s
+  # engine: clickhouse   # ClickHouse example (one engine per process):
+  #   upstream:
+  #     engine: clickhouse
+  #     url: http://clickhouse:8123
+  #   ClickHouse Tier 2 is rows-only (EXPLAIN ESTIMATE has no byte/CPU
+  #   estimate) — configure max_rows limits:
+  #   cost_limits:
+  #     - schema: default
+  #       table: hits
+  #       max_rows: 1000000
 
 preflight:
   timeout: 2s
